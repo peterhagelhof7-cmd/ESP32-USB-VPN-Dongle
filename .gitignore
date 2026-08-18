@@ -1,0 +1,12 @@
+# PlatformIO / ESP-IDF Build-Artefakte
+.pio/
+firmware/.pio/
+firmware/managed_components/
+firmware/dependencies.lock
+firmware/sdkconfig.*
+!firmware/sdkconfig.defaults
+firmware/build/
+
+# Editor
+.vscode/
+*.swp

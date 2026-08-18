@@ -1,0 +1,917 @@
+# ESP32-USB-VPN-Dongle – erweiterte Projektbeschreibung
+
+## 1. Projektziel
+
+Entwicklung eines kleinen USB-Geräts auf Basis des **ESP32-S2 oder S3**, das sich gegenüber Windows und macOS als **USB-Netzwerkadapter** präsentiert.
+
+Der Benutzer steckt den ESP32-S2 per USB an den Rechner. Das Betriebssystem erkennt ihn als Netzwerkgerät. Anschließend öffnet sich möglichst automatisch die Konfigurationsseite des ESP32 über die **Captive-Portal-/„Netzwerk erfordert Anmeldung“-Funktion**.
+
+Der Benutzer muss keine IP-Adresse kennen und zunächst auch keinen Treiber oder WireGuard-Client installieren.
+
+Das Gerät übernimmt:
+
+* USB-NCM-Netzwerkadapter
+* WLAN-Client
+* DHCP
+* DNS
+* Captive Portal
+* NAT/Routing
+* WireGuard
+* Firewall
+* Kill Switch
+* Webinterface
+* RDP-/Ressourcenverwaltung
+
+---
+
+# 2. Benutzererlebnis
+
+Das gewünschte Benutzererlebnis:
+
+```
+USB einstecken
+      │
+      ▼
+Windows/macOS erkennt USB-Netzwerk
+      │
+      ▼
+DHCP vom ESP32
+      │
+      ▼
+Captive Portal erkannt
+      │
+      ▼
+„Netzwerk erfordert Anmeldung“
+      │
+      ▼
+Webinterface des ESP32
+      │
+      ▼
+WLAN auswählen
+      │
+      ▼
+WLAN verbunden
+      │
+      ▼
+Administrator-Login
+      │
+      ▼
+WireGuard verbinden
+      │
+      ▼
+VPN verfügbar
+      │
+      ▼
+Interne Ressourcen
+```
+
+---
+
+# 3. USB-NCM
+
+Der ESP32-S2 verwendet seine native USB-Schnittstelle.
+
+Gegenüber dem Computer erscheint er als:
+
+> USB Network Adapter
+
+Ziel ist die Verwendung von **USB NCM**, sodass möglichst kein eigener ESP32-Treiber installiert werden muss.
+
+```text
+Windows / macOS
+       │
+       │ USB-C
+       ▼
+ESP32-S2 Mini
+       │
+       ▼
+USB-NCM
+```
+
+Der ESP32 stellt dabei ein eigenes kleines Netzwerk bereit.
+
+Beispiel:
+
+```text
+ESP32:
+192.168.226.1
+DHCP Range nur 8 Hosts, entsprechend kleine netzmaske wählen, DHCP Lease Zeit 10min
+
+PC:
+192.168.226.2
+
+```
+
+---
+
+# 4. Captive Portal / automatische Webseitenerkennung
+
+Eine zentrale Funktion des Projekts ist die Nutzung der Betriebssystemfunktion:
+
+> **„Netzwerk erfordert Anmeldung“**
+
+bzw. des Captive-Portals.
+
+Nach dem USB-Anschluss soll das Betriebssystem erkennen, dass das USB-Netzwerk zunächst eine Webkonfiguration benötigt.
+
+Der ESP32 stellt dafür:
+
+* DHCP
+* DNS
+* HTTP
+* Captive-Portal-Erkennung
+
+bereit.
+
+### Ablauf
+
+```text
+PC
+ │
+ │ DHCP
+ ▼
+ESP32
+ │
+ ├── IP-Adresse
+ ├── Gateway
+ └── DNS
+```
+
+Windows/macOS führt anschließend seine normale Netzwerk-/Connectivity-Prüfung durch.
+
+Der ESP32 beantwortet diese Anfragen so, dass das Betriebssystem erkennt:
+
+> Netzwerk erfordert Anmeldung
+
+Daraufhin kann das Betriebssystem dem Benutzer die Webanmeldung anbieten.
+
+---
+
+# 5. Webinterface
+
+Das Webinterface ist die zentrale Bedienoberfläche.
+
+Ziel-URL beispielsweise:
+
+```text
+http://192.168.226.1/
+```
+
+Der Benutzer soll diese Adresse aber normalerweise **nicht kennen müssen**.
+
+---
+
+# 6. Nicht angemeldeter Benutzer
+
+Ohne Login werden nur die für die Erstkonfiguration notwendigen Funktionen angezeigt.
+
+```text
+┌───────────────────────────────┐
+│        ESP32 USB VPN          │
+├───────────────────────────────┤
+│ WLAN auswählen                │
+│                               │
+│ ● Büro-WLAN                   │
+│ ○ FritzBox-1234               │
+│ ○ Handy-Hotspot               │
+│ ○ Gast-WLAN                   │
+│                               │
+│ Passwort: [**************]    │
+│                               │
+│       [ Verbinden ]           │
+└───────────────────────────────┘
+```
+
+Erlaubt:
+
+* WLAN-Scan
+* WLAN auswählen
+* WLAN-Passwort eingeben
+* WLAN verbinden
+* WLAN-Status anzeigen
+* Betriebsmodus Wahl (alles durch die VPN/ VPN nur geroutet)
+* Datei download
+
+Nicht erlaubt:
+
+* WireGuard-Konfiguration anzeigen
+* Private Keys anzeigen
+* Firewall verändern
+* RDP-Ziele verändern
+* Firmware ändern
+* OTA Update
+* Datei Upload
+
+---
+
+# 7. Administrator-Login
+
+Nach erfolgreicher WLAN-Verbindung:
+
+```text
+WLAN
+🟢 verbunden
+
+WireGuard
+🔴 nicht verbunden
+
+[ Administrator anmelden ]
+```
+
+Nach erfolgreichem Login stehen weitere Funktionen zur Verfügung.
+
+---
+
+# 8. Administratorbereich
+
+```text
+┌────────────────────────────────┐
+│ ESP32 USB VPN                  │
+├────────────────────────────────┤
+│ Status                         │
+│ WLAN                           │
+│ WireGuard                      │
+│ Routing                        │
+│ Firewall                       │
+│ Datei Upload                   │
+│ System                         │
+│ Firmware                       │
+└────────────────────────────────┘
+```
+
+---
+
+# 9. WLAN
+
+Der ESP32 arbeitet als **WLAN-Client**.
+
+Der Benutzer kann:
+
+* WLAN scannen
+* SSID auswählen
+* Passwort eingeben
+* Verbindung testen
+* gespeichertes WLAN ändern
+* WLAN-Verbindung trennen
+* Betriebsmodus Wahl (alles durch die VPN/ VPN nur geroutet)
+
+Optional können mehrere WLAN-Profile gespeichert werden.
+
+Beispielsweise:
+
+```text
+1. Büro
+2. Zuhause
+3. Handy
+
+es Muss eine Checkbox "automatisch verbinden wenn in reichweite" geben.
+```
+
+Der ESP kann automatisch das bevorzugte verfügbare WLAN auswählen.
+
+---
+
+# 10. WireGuard
+
+Der ESP32 baut den WireGuard-Tunnel selbst auf.
+
+Eine normale WireGuard-Konfigurationsdatei kann importiert werden.
+
+```ini
+[Interface]
+PrivateKey = ...
+Address = 10.10.0.2/24
+DNS = 10.10.0.1
+PSK Optional
+
+[Peer]
+PublicKey = ...
+Endpoint = vpn.example.de:51820
+AllowedIPs = 10.10.0.0/24
+PersistentKeepalive = 25
+```
+
+Der Private Key wird geschützt gespeichert und nicht im normalen Webinterface angezeigt.
+
+---
+
+# 11. Split Tunnel
+
+Es sollen gezielt interne Netzwerke über WireGuard erreichbar sein.
+
+Beispiel:
+
+```text
+10.10.0.0/24
+192.168.100.0/24
+172.16.20.0/24
+
+```
+
+Routing:
+
+```text
+Windows
+   │
+   ├── Internet ─────────────► WLAN
+   │
+   ├── 10.10.0.0/24 ────────► WireGuard
+   │
+   ├── 192.168.100.0/24 ────► WireGuard
+   │
+   └── 172.16.20.0/24 ──────► WireGuard
+```
+der DHCP server gibt gezielt DHCP Classless Static Routes (Option 121) für die VPN Netzwerke aus
+---
+
+# 12. Full Tunnel
+
+Optional kann sämtlicher Datenverkehr über WireGuard laufen.
+
+```text
+Windows
+   │
+   ▼
+ESP32
+   │
+   ▼
+WireGuard
+   │
+   ▼
+VPN-Server
+   │
+   ▼
+Internet
+```
+der DHCP server gibt gezielt DHCP Classless Static Routes (Option 121) für die 0.0.0.0/0 Netzwerk aus
+
+
+Damit kann der ESP32 als vollständiger VPN-Router arbeiten.
+
+---
+
+# 13. Kill Switch
+
+Der Kill Switch verhindert einen VPN-Leak.
+
+### VPN aktiv
+
+```text
+USB
+ │
+ ▼
+ESP32
+ │
+ ▼
+WireGuard 🟢
+ │
+ ▼
+Internet
+```
+
+### VPN ausgefallen
+
+```text
+USB
+ │
+ ▼
+ESP32
+ │
+ ▼
+WireGuard 🔴
+ │
+ X
+Internet
+```
+
+Der Zugriff auf das lokale ESP-Webinterface bleibt weiterhin möglich.
+
+---
+
+# 14. NAT und Routing
+
+Der ESP32 arbeitet als Router zwischen USB und WLAN/WireGuard.
+
+```text
+             ESP32-S2
+        ┌─────────────────┐
+        │                 │
+USB ───►│ Routing + NAT   │
+        │       │         │
+        │       ▼         │
+        │ WireGuard       │
+        │       │         │
+        │       ▼         │
+        │ WLAN            │
+        └─────────────────┘
+```
+
+Damit muss Windows nichts über das dahinterliegende WLAN oder VPN wissen.
+
+---
+
+# 15. RDP-Ressourcen
+
+Im ESP32-Flash können Dateien gespeichert werden.
+
+Beispiel:
+
+```text
+Terminalserver
+10.10.10.10
+
+Server 01
+10.10.10.20
+
+Server 02
+10.10.10.21
+
+Login Netzlaufwerke
+login.bat
+```
+
+Im Webinterface:
+
+```text
+Interne Ressourcen
+
+🖥 Terminalserver
+   10.10.10.10
+
+   [ RDP herunterladen ]
+
+🖥 Server 01
+   10.10.10.20
+
+   [ RDP herunterladen ]
+ 
+Netzlaufwerke
+	Login.bat
+	[ Datei herunterladen ]
+	
+Automatisch generierte dateien die die default route auf das Netzwerk des ESP setzten mit Hinweis benötigt admin rechte	
+```
+
+---
+
+# 16. in späterem Release evtl. vorgesehen : Dynamische RDP-Dateien
+
+Die `.rdp`-Dateien können dynamisch erzeugt werden.
+
+Beispiel:
+
+```text
+Name:
+Terminalserver
+
+Adresse:
+10.10.10.10
+
+Port:
+3389
+```
+
+Beim Klick auf:
+
+> **RDP herunterladen**
+
+generiert der ESP:
+
+```text
+Terminalserver.rdp
+```
+
+und liefert sie an den Browser aus.
+
+Damit können sich die RDP-Ziele zentral im Webinterface verwalten lassen.
+
+---
+
+# 17. Weitere interne Ressourcen
+
+Das Konzept sollte nicht auf RDP beschränkt sein.
+
+Später könnten beispielsweise angeboten werden:
+
+```text
+🖥 Terminalserver
+🌐 Intranet
+🗄 NAS
+🔧 Webinterface
+📡 Netzwerkgerät
+🖥 SSH-Server
+```
+
+Dabei können unterschiedliche Protokolle und Links hinterlegt werden.
+
+Beispiel:
+
+```text
+Intranet
+https://intranet.example.local
+
+[ Öffnen ]
+```
+
+oder:
+
+```text
+SSH Server
+10.10.10.30
+
+[ SSH-Verbindung ]
+```
+
+---
+
+# 18. Windows und macOS
+
+Das Gerät soll möglichst betriebssystemunabhängig funktionieren.
+
+### Windows
+
+```text
+USB-NCM
+   ↓
+Netzwerkadapter
+   ↓
+Captive Portal
+   ↓
+Webinterface
+```
+
+RDP:
+
+```text
+.rdp
+ ↓
+Windows Remote Desktop
+```
+
+### macOS
+
+```text
+USB-NCM
+   ↓
+Netzwerkadapter
+   ↓
+Captive Portal/Webbrowser
+```
+
+RDP kann über die entsprechende Microsoft-Anwendung für macOS genutzt werden.
+
+---
+
+# 19. Statusseite
+
+Nach der Konfiguration soll eine zentrale Statusseite vorhanden sein.
+
+```text
+ESP32 USB VPN
+
+USB
+🟢 verbunden
+
+WLAN
+🟢 Büro-WLAN
+Signal: -54 dBm
+
+Internet
+🟢 erreichbar
+
+WireGuard
+🟢 verbunden
+
+VPN-IP
+10.10.0.2
+
+Letzter Handshake
+12 Sekunden
+
+RX
+12.4 MB
+
+TX
+4.8 MB
+
+Kill Switch
+🟢 aktiv
+```
+
+---
+
+# 20. Netzwerkstatus
+
+Zusätzlich könnten angezeigt werden:
+
+```text
+USB-IP:
+192.168.50.1
+
+Client-IP:
+192.168.50.2
+
+WLAN-IP:
+192.168.178.50
+
+VPN-IP:
+10.10.0.2
+
+Gateway:
+192.168.178.1
+
+DNS:
+192.168.178.1
+```
+
+---
+
+# 21. Webinterface als zentrale Steuerung
+
+Das Webinterface sollte möglichst keine technischen Kenntnisse voraussetzen.
+
+### Startseite
+
+```text
+┌─────────────────────────────────┐
+│ ESP32 VPN                        │
+├─────────────────────────────────┤
+│                                 │
+│ USB       🟢                    │
+│ WLAN      🟢                    │
+│ VPN       🟢                    │
+│                                 │
+│     Verbindung aktiv             │
+│                                 │
+├─────────────────────────────────┤
+│ Interne Ressourcen              │
+│                                 │
+│ 🖥 Terminalserver               │
+│ 🖥 Server 01                    │
+│ 🌐 Intranet                     │
+│                                 │
+└─────────────────────────────────┘
+```
+
+Der Benutzer soll nach erfolgreicher Konfiguration möglichst **nur noch einstecken müssen**.
+
+---
+
+# 22. Automatischer Verbindungsaufbau
+
+Nach der Erstkonfiguration:
+
+```text
+USB einstecken
+      ↓
+ESP32 bootet
+      ↓
+WLAN verbinden
+      ↓
+Internet prüfen
+      ↓
+WireGuard starten
+      ↓
+Handshake prüfen
+      ↓
+Routing aktivieren
+      ↓
+USB-Netzwerk freigeben
+```
+
+Bei einem VPN-Ausfall:
+
+```text
+VPN verloren
+     ↓
+Traffic blockieren
+     ↓
+WireGuard neu verbinden
+     ↓
+Handshake erfolgreich
+     ↓
+Traffic wieder freigeben
+```
+
+---
+
+# 23. Hardware
+
+Für den ersten Prototyp:
+
+**wemos S2 Mini**
+
+Vorteile:
+
+* ESP32-S2
+* integriertes WLAN
+* native USB
+* USB-C
+* kompakt
+* günstig
+* genügend GPIOs für Erweiterungen
+* KY-016 modul zum anzeigen des Betriebsstatus:
+- rot WLAN und VPN nicht verbunden
+- Blau WLAN Verbunden
+- Grün VPN Verbunden
+
+
+---
+
+# 24. Softwarearchitektur
+
+```text
+┌──────────────────────────────────────┐
+│ Webinterface                         │
+├──────────────────────────────────────┤
+│ Captive Portal                       │
+├──────────────────────────────────────┤
+│ Authentication                       │
+├──────────────────────────────────────┤
+│ RDP / Resource Manager               │
+├──────────────────────────────────────┤
+│ Configuration Manager                │
+├──────────────────────────────────────┤
+│ Firewall / Kill Switch               │
+├──────────────────────────────────────┤
+│ NAT / Routing                        │
+├──────────────────────────────────────┤
+│ WireGuard                            │
+├──────────────────────────────────────┤
+│ lwIP                                 │
+├──────────────────────────────────────┤
+│ WiFi                                 │
+├──────────────────────────────────────┤
+│ USB NCM / TinyUSB                    │
+├──────────────────────────────────────┤
+│ ESP32-S2                             │
+└──────────────────────────────────────┘
+```
+
+---
+
+# 25. Vorhandene Open-Source-Bausteine
+
+## USB-NCM
+
+Espressif:
+
+[https://github.com/espressif/esp-idf/tree/master/examples/peripherals/usb/device/tusb_ncm](https://github.com/espressif/esp-idf/tree/master/examples/peripherals/usb/device/tusb_ncm)
+
+## NAT Router
+
+Martin Gergeleit:
+
+[https://github.com/martin-ger/esp32_nat_router](https://github.com/martin-ger/esp32_nat_router)
+
+Bereits vorhanden sind unter anderem:
+
+* NAT
+* Routing
+* WLAN
+* DHCP
+* DNS
+* Webinterface
+* WireGuard
+* Kill Switch
+* Firewall/ACL
+
+## WireGuard
+
+[https://github.com/trombik/esp_wireguard](https://github.com/trombik/esp_wireguard)
+und ähnliche
+---
+
+# 26. Entwicklungsphasen
+
+erstellen einer flash.ps1 um das Projekt direkt aus dem github zu flashen auf einen neuen ESP
+
+### Phase 1
+
+USB-NCM:
+
+```text
+PC ↔ ESP32
+```
+
+### Phase 2
+
+WLAN:
+
+```text
+PC ↔ USB ↔ ESP32 ↔ WLAN
+```
+
+### Phase 3
+
+DHCP + DNS + NAT:
+
+```text
+PC ↔ USB ↔ NAT ↔ WLAN
+```
+
+### Phase 4
+
+Captive Portal:
+
+```text
+USB
+ ↓
+DHCP
+ ↓
+DNS
+ ↓
+NCSI/Captive Portal
+ ↓
+Webinterface
+```
+
+### Phase 5
+
+WireGuard:
+
+```text
+USB → NAT → WireGuard → WLAN
+```
+
+### Phase 6
+
+Kill Switch und Firewall.
+
+### Phase 7
+
+Admin-Login und sichere Konfigurationsspeicherung.
+
+### Phase 8
+
+RDP-/Ressourcenverwaltung.
+
+### Phase 9
+
+Automatischer Verbindungsaufbau.
+
+### Phase 10
+
+Performanceoptimierung und Stabilität.
+
+---
+
+# 27. Endgültiges Konzept
+
+Das fertige Gerät ist ein kleiner:
+
+## **ESP32-S2 USB VPN Gateway**
+
+Der Benutzer benötigt lediglich:
+
+**USB-Kabel + WLAN**
+
+Das Gerät übernimmt:
+
+```text
+             ┌──────────────────────┐
+             │     ESP32-S2 Mini    │
+             │                      │
+PC/Mac ◄────►│ USB-NCM              │
+             │                      │
+             │ DHCP                 │
+             │ DNS                  │
+             │ Captive Portal       │
+             │ Webinterface         │
+             │ NAT                  │
+             │ Firewall             │
+             │ WireGuard            │
+             │ Kill Switch          │
+             │ RDP Manager          │
+             │                      │
+             │ WLAN                 │
+             └──────────┬───────────┘
+                        │
+                        ▼
+                     WLAN
+                        │
+                        ▼
+                   Internet
+                        │
+                        ▼
+                 WireGuard Server
+                        │
+                        ▼
+                internes Netzwerk
+```
+
+### Das besondere Merkmal
+
+**Der Rechner muss nichts über VPN wissen.**
+
+Er sieht nur:
+
+> **USB-Netzwerkadapter**
+
+Die gesamte VPN- und Routing-Funktion steckt im ESP32.
+
+Zusätzlich sorgt das **Captive Portal** dafür, dass der Benutzer nach dem Einstecken möglichst automatisch zur Konfigurationsseite geführt wird.
+
+Damit entsteht aus dem ursprünglichen ESP32-S2-Projekt ein **kleiner, portabler Plug-and-Play-VPN-Gateway**, der insbesondere für Wartung, Remote-Arbeit und den Zugriff auf abgeschottete interne Netzwerke interessant ist.
+erwartete Wlan Performance 10Mbits
+erwartete VPN Performance 5Mbits
