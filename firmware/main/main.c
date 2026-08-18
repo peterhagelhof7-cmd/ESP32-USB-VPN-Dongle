@@ -19,6 +19,7 @@
 #include "nvs.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "lwip/sockets.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
@@ -38,7 +39,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "phase3"
+#define FW_BUILD_TAG "phase4"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -57,6 +58,22 @@ static volatile bool  s_wifi_connected;
 static esp_ip4_addr_t s_wifi_ip;
 static int            s_wifi_retry;
 static bool           s_nat_on;
+// Captive-Portal-Zustand: gesperrt (Default) -> kein Internet, DNS-Hijack aufs
+// Dongle-Webinterface; entsperrt -> NAT an, DNS wird echt weitergeleitet.
+static volatile bool  s_unlocked;
+
+// Internet-Freigabe an-/ausschalten (NAPT auf dem USB-Interface).
+static void set_internet(bool on)
+{
+    if (!s_usb_netif) return;
+    if (on) {
+        s_nat_on = (esp_netif_napt_enable(s_usb_netif) == ESP_OK);
+    } else {
+        esp_netif_napt_disable(s_usb_netif);
+        s_nat_on = false;
+    }
+    ESP_LOGI(TAG, "Internet-Freigabe: %s", s_nat_on ? "AN (NAT)" : "AUS");
+}
 
 static void led_set(int r, int g, int b)
 {
@@ -239,8 +256,15 @@ static esp_err_t root_get(httpd_req_t *req)
     bool routing = s_nat_on && s_wifi_connected;
     const char *rstat = routing ? "aktiv (NAT)" : (s_nat_on ? "wartet auf WLAN" : "aus");
     const char *rcol  = routing ? "#43d17a" : "#f0a35e";
+    const char *lockbanner = s_unlocked ? ""
+        : "<p style='color:#f0a35e;font-weight:bold'>Netzwerk erfordert Anmeldung</p>";
+    const char *zcol  = s_unlocked ? "#43d17a" : "#f0a35e";
+    const char *ztext = s_unlocked ? "entsperrt (Internet frei)" : "gesperrt (kein Internet)";
+    const char *zbtn  = s_unlocked
+        ? "<form method=post action=/lock><button type=submit>Sperren</button></form>"
+        : "<form method=post action=/unlock><button type=submit>Anmelden (Internet freigeben)</button></form>";
 
-    static char page[3200];
+    static char page[3600];
     snprintf(page, sizeof(page),
         "<!doctype html><html><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -254,6 +278,10 @@ static esp_err_t root_get(httpd_req_t *req)
         "</style></head><body>"
         "<h1>ESP32-USB-VPN-Dongle</h1>"
         "<p class=ok>USB-NCM aktiv - PC per DHCP am Dongle (192.168.226.1).</p>"
+        "%s"   /* Sperr-Banner */
+        "<div class=card><b>Zugang</b>"
+        "<div style='font-size:13px'>Status: <b style='color:%s'>%s</b></div>"
+        "%s</div>"
         "<div class=card><b>WLAN-Uplink</b>"
         "<div style='font-size:13px'>Status: <b style='color:%s'>%s</b></div>"
         "<div style='font-size:13px'>IP vom Router: %s</div>"
@@ -289,6 +317,7 @@ static esp_err_t root_get(httpd_req_t *req)
         "if(x.status==200)setTimeout(function(){location.reload();},5000);};"
         "x.onerror=function(){st.textContent='Fehler beim Upload';};"
         "x.send(file);};</script></body></html>",
+        lockbanner, zcol, ztext, zbtn,
         wcol, wstat, ipbuf, rcol, rstat, s_wifi_ssid,
         app ? app->version : "?", FW_BUILD_TAG,
         esp_ota_get_running_partition()->label);
@@ -412,21 +441,146 @@ static esp_err_t scan_get(httpd_req_t *req)
     return httpd_resp_sendstr(req, json);
 }
 
+// --- DNS-Server: Captive-Hijack (gesperrt) / Weiterleitung (entsperrt) --------
+static uint32_t upstream_dns_addr(void)
+{
+    esp_netif_dns_info_t d;
+    if (s_sta_netif && esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &d) == ESP_OK
+        && d.ip.u_addr.ip4.addr != 0) {
+        return d.ip.u_addr.ip4.addr;
+    }
+    return esp_ip4addr_aton("8.8.8.8");
+}
+
+static void dns_forward(int sock, uint8_t *q, int qlen, struct sockaddr_in *cli, socklen_t clen)
+{
+    int up = socket(AF_INET, SOCK_DGRAM, 0);
+    if (up < 0) return;
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in ups = { .sin_family = AF_INET, .sin_port = htons(53) };
+    ups.sin_addr.s_addr = upstream_dns_addr();
+    if (sendto(up, q, qlen, 0, (struct sockaddr *)&ups, sizeof(ups)) == qlen) {
+        uint8_t resp[512];
+        int rl = recv(up, resp, sizeof(resp), 0);
+        if (rl > 0) sendto(sock, resp, rl, 0, (struct sockaddr *)cli, clen);
+    }
+    close(up);
+}
+
+// gesperrt: A-Anfragen -> 192.168.226.1, sonst leere Antwort (erzwingt Portal/IPv4)
+static void dns_hijack(int sock, uint8_t *q, int qlen, struct sockaddr_in *cli, socklen_t clen)
+{
+    int i = 12;
+    while (i < qlen && q[i] != 0) i += q[i] + 1;   // Frage-Name ueberspringen
+    if (i + 5 > qlen) return;
+    uint16_t qtype = (q[i + 1] << 8) | q[i + 2];
+    int qsec_end = i + 5;
+
+    uint8_t r[600];
+    memcpy(r, q, qsec_end);
+    r[2] = 0x81; r[3] = 0x80;                 // QR=1, RD kopiert, RA=1
+    r[6] = 0; r[7] = (qtype == 1) ? 1 : 0;    // ANCOUNT (nur A beantworten)
+    r[8] = r[9] = r[10] = r[11] = 0;
+    int o = qsec_end;
+    if (qtype == 1) {
+        r[o++] = 0xC0; r[o++] = 0x0C;         // Zeiger auf Frage-Name
+        r[o++] = 0x00; r[o++] = 0x01;         // TYPE A
+        r[o++] = 0x00; r[o++] = 0x01;         // CLASS IN
+        r[o++] = 0; r[o++] = 0; r[o++] = 0; r[o++] = 30;   // TTL 30s
+        r[o++] = 0x00; r[o++] = 0x04;         // RDLENGTH
+        r[o++] = 192; r[o++] = 168; r[o++] = 226; r[o++] = 1;
+    }
+    sendto(sock, r, o, 0, (struct sockaddr *)cli, clen);
+}
+
+static void dns_server_task(void *arg)
+{
+    (void)arg;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(53),
+                              .sin_addr.s_addr = htonl(INADDR_ANY) };
+    if (sock < 0 || bind(sock, (struct sockaddr *)&me, sizeof(me)) < 0) {
+        ESP_LOGE(TAG, "DNS-Server bind fehlgeschlagen");
+        if (sock >= 0) close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "DNS-Server auf :53 aktiv");
+    uint8_t buf[512];
+    while (1) {
+        struct sockaddr_in cli; socklen_t cl = sizeof(cli);
+        int len = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&cli, &cl);
+        if (len < 12) continue;
+        if (s_unlocked) dns_forward(sock, buf, len, &cli, cl);
+        else            dns_hijack(sock, buf, len, &cli, cl);
+    }
+}
+
+static void start_dns(void)
+{
+    xTaskCreate(dns_server_task, "dns_srv", 4096, NULL, 5, NULL);
+}
+
+// Catch-all: im gesperrten Zustand jede unbekannte URL auf die Portalseite
+// umleiten -> loest die Captive-Erkennung von Windows/macOS/Android aus.
+static esp_err_t captive_redirect(httpd_req_t *req)
+{
+    if (!s_unlocked) {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "http://192.168.226.1/");
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        return httpd_resp_sendstr(req,
+            "<meta http-equiv=refresh content='0;url=http://192.168.226.1/'>"
+            "Netzwerk erfordert Anmeldung");
+    }
+    httpd_resp_set_status(req, "404 Not Found");
+    return httpd_resp_sendstr(req, "not found");
+}
+
+static esp_err_t unlock_post(httpd_req_t *req)
+{
+    s_unlocked = true;
+    set_internet(true);
+    ESP_LOGI(TAG, "Captive-Portal ENTSPERRT");
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_sendstr(req, "");
+}
+
+static esp_err_t lock_post(httpd_req_t *req)
+{
+    s_unlocked = false;
+    set_internet(false);
+    ESP_LOGI(TAG, "Captive-Portal GESPERRT");
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_sendstr(req, "");
+}
+
 static void start_http(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
     cfg.stack_size = 8192;   // OTA-Handler braucht mehr Stack
+    cfg.max_uri_handlers = 10;
+    cfg.uri_match_fn = httpd_uri_match_wildcard;   // fuer Catch-all "/*"
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &cfg) == ESP_OK) {
-        httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get };
-        httpd_uri_t ota  = { .uri = "/ota", .method = HTTP_POST, .handler = ota_post };
-        httpd_uri_t wifi = { .uri = "/wifi", .method = HTTP_POST, .handler = wifi_post };
-        httpd_uri_t scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get };
+        httpd_uri_t root   = { .uri = "/",       .method = HTTP_GET,  .handler = root_get };
+        httpd_uri_t ota    = { .uri = "/ota",    .method = HTTP_POST, .handler = ota_post };
+        httpd_uri_t wifi   = { .uri = "/wifi",   .method = HTTP_POST, .handler = wifi_post };
+        httpd_uri_t scan   = { .uri = "/scan",   .method = HTTP_GET,  .handler = scan_get };
+        httpd_uri_t unlock = { .uri = "/unlock", .method = HTTP_POST, .handler = unlock_post };
+        httpd_uri_t lock   = { .uri = "/lock",   .method = HTTP_POST, .handler = lock_post };
+        httpd_uri_t any    = { .uri = "/*",      .method = HTTP_GET,  .handler = captive_redirect };
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ota);
         httpd_register_uri_handler(server, &wifi);
         httpd_register_uri_handler(server, &scan);
+        httpd_register_uri_handler(server, &unlock);
+        httpd_register_uri_handler(server, &lock);
+        httpd_register_uri_handler(server, &any);   // muss ZULETZT registriert werden
         ESP_LOGI(TAG, "HTTP-Server auf 192.168.226.1 gestartet");
     } else {
         ESP_LOGE(TAG, "HTTP-Server-Start fehlgeschlagen");
@@ -501,11 +655,10 @@ static void start_usb_netif(void)
     esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET,
                            ESP_NETIF_IP_ADDRESS_LEASE_TIME, &lease_min, sizeof(lease_min));
 
-    // DHCP-Server soll dem PC einen DNS-Server nennen. 8.8.8.8 ist per NAT
-    // erreichbar; spaeter (Captive-Portal, Phase 4) ersetzen wir das durch den
-    // dongle-eigenen DNS-Forwarder.
+    // DHCP-Server nennt dem PC den DONGLE selbst als DNS (192.168.226.1) -> unser
+    // DNS-Server faengt Anfragen ab (Captive-Portal) bzw. leitet sie weiter.
     esp_netif_dns_info_t dns = {
-        .ip = { .type = ESP_IPADDR_TYPE_V4, .u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8") },
+        .ip = { .type = ESP_IPADDR_TYPE_V4, .u_addr.ip4.addr = esp_ip4addr_aton("192.168.226.1") },
     };
     esp_netif_set_dns_info(s_usb_netif, ESP_NETIF_DNS_MAIN, &dns);
     uint8_t offer_dns = 0x02;   // OFFER_DNS -> DNS-Option im DHCP-Angebot aktiv
@@ -516,20 +669,14 @@ static void start_usb_netif(void)
     esp_netif_action_connected(s_usb_netif, NULL, 0, NULL);   // Link up (ESP-Seite)
     esp_netif_dhcps_start(s_usb_netif);                       // DHCP-Server an
 
-    // NAPT auf dem USB-(LAN-)Interface: ausgehende Pakete vom PC (192.168.226.x)
-    // werden beim Forwarding auf die WLAN-STA-Adresse ge-SNAT-et (inp->napt-Modell
-    // von lwIP). Muss auf dem INPUT-/internen Interface aktiviert werden.
-    if (esp_netif_napt_enable(s_usb_netif) == ESP_OK) {
-        s_nat_on = true;
-        ESP_LOGI(TAG, "NAPT aktiv auf USB-Interface (Routing PC -> WLAN)");
-    } else {
-        ESP_LOGW(TAG, "NAPT konnte nicht aktiviert werden");
-    }
+    // NAPT bleibt zunaechst AUS (Captive-Portal gesperrt). Wird beim Entsperren
+    // via set_internet(true) aktiviert (NAPT-Muster: inp->napt auf USB, SNAT
+    // ausgehend auf die WLAN-STA-Adresse).
 
     // WICHTIG: dem HOST "Link up" signalisieren, sonst bleibt der Adapter
     // "Dormant" und Windows/macOS schickt gar kein DHCP.
     tud_network_link_state(0, true);
-    ESP_LOGI(TAG, "USB-netif aktiv: 192.168.226.1/29, DHCP-Server + DNS + NAT, Link=up");
+    ESP_LOGI(TAG, "USB-netif aktiv: 192.168.226.1/29, DHCP + DNS(Captive), NAT gesperrt, Link=up");
 }
 
 void app_main(void)
@@ -571,12 +718,13 @@ void app_main(void)
 
     start_usb_netif();    // dann Subnetz + DHCP (nicht-fatal)
     start_wifi();          // Phase 2: WLAN-Uplink (STA)
+    start_dns();           // Phase 4: DNS-Server (Captive-Hijack / Weiterleitung)
     start_http();
 
     // Diese App gilt jetzt als lauffaehig -> Rollback abbrechen (fuer OTA).
     esp_ota_mark_app_valid_cancel_rollback();
 
-    ESP_LOGI(TAG, "Phase 3 bereit: USB-NCM + WLAN-STA + NAT/DNS. netif-RX %s.",
+    ESP_LOGI(TAG, "Phase 4 bereit: USB-NCM + WLAN + NAT/DNS + Captive-Portal. netif-RX %s.",
              DIAG_NO_NETIF_RX ? "ABGESCHALTET (nur zaehlen)" : "aktiv");
 
     // Diagnose-Heartbeat: solange das hier laeuft, lebt das Geraet.
