@@ -16,6 +16,8 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 #include "driver/gpio.h"
 
 #include "tinyusb.h"
@@ -69,33 +71,87 @@ static esp_err_t usb_recv_cb(void *buffer, uint16_t len, void *ctx)
     return ESP_OK;
 }
 
-// --- HTTP-Testseite ---------------------------------------------------------
+// --- HTTP-Testseite + OTA-Update --------------------------------------------
 static esp_err_t root_get(httpd_req_t *req)
 {
-    static const char *page =
+    const esp_app_desc_t *app = esp_app_get_description();
+    static char page[1600];
+    snprintf(page, sizeof(page),
         "<!doctype html><html><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
         "<title>ESP32 USB VPN</title>"
         "<style>body{font-family:sans-serif;background:#0f1626;color:#e6e6e6;"
-        "text-align:center;padding:40px}h1{color:#5cc8ff}.ok{color:#43d17a}</style>"
-        "</head><body><h1>ESP32-USB-VPN-Dongle</h1>"
+        "text-align:center;padding:32px}h1{color:#5cc8ff}.ok{color:#43d17a}"
+        ".card{background:#16203c;border:1px solid #33406a;border-radius:10px;"
+        "max-width:460px;margin:18px auto;padding:18px}button{padding:8px 16px}"
+        "progress{width:100%%;margin-top:8px}</style></head><body>"
+        "<h1>ESP32-USB-VPN-Dongle</h1>"
         "<p class=ok>Phase 1: USB-NCM funktioniert.</p>"
-        "<p>Der PC hat eine IP per DHCP vom Dongle erhalten und erreicht "
-        "das Webinterface unter <b>192.168.226.1</b>.</p>"
-        "<p>WLAN / NAT / WireGuard folgen in den naechsten Phasen.</p>"
-        "</body></html>";
+        "<p>Der PC hat per DHCP eine IP vom Dongle erhalten und erreicht das "
+        "Webinterface unter <b>192.168.226.1</b>. WLAN / NAT / WireGuard folgen.</p>"
+        "<div class=card><b>Firmware-Update (OTA)</b>"
+        "<div style='font-size:13px;color:#8ab4f8'>Version: %s</div>"
+        "<form id=f><input type=file id=fw accept='.bin' required>"
+        "<button type=submit>Update einspielen</button></form>"
+        "<progress id=p max=100 value=0 hidden></progress>"
+        "<div id=st style='font-size:13px'></div></div>"
+        "<script>f.onsubmit=function(e){e.preventDefault();var file=fw.files[0];"
+        "if(!file)return;var x=new XMLHttpRequest();x.open('POST','/ota');"
+        "p.hidden=false;x.upload.onprogress=function(ev){var v=Math.round("
+        "ev.loaded/ev.total*100);p.value=v;st.textContent=v+'%%';};"
+        "x.onload=function(){st.textContent=x.responseText;"
+        "if(x.status==200)setTimeout(function(){location.reload();},5000);};"
+        "x.onerror=function(){st.textContent='Fehler beim Upload';};"
+        "x.send(file);};</script></body></html>",
+        app ? app->version : "?");
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_sendstr(req, page);
+}
+
+// OTA: roher .bin-Body in die inaktive Partition schreiben, dann Neustart.
+// (Phase 1: ohne Auth — wird in Phase 7 auf Admin beschraenkt.)
+static esp_err_t ota_post(httpd_req_t *req)
+{
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "keine OTA-Partition"); return ESP_FAIL; }
+
+    esp_ota_handle_t h = 0;
+    if (esp_ota_begin(part, OTA_SIZE_UNKNOWN, &h) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_begin fehlgeschlagen");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "OTA-Upload -> Partition '%s' (%d Bytes)", part->label, req->content_len);
+
+    static char buf[1024];
+    int remaining = req->content_len;
+    while (remaining > 0) {
+        int want = remaining < (int)sizeof(buf) ? remaining : (int)sizeof(buf);
+        int r = httpd_req_recv(req, buf, want);
+        if (r <= 0) { esp_ota_abort(h); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empfang abgebrochen"); return ESP_FAIL; }
+        if (esp_ota_write(h, buf, r) != ESP_OK) { esp_ota_abort(h); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Schreibfehler"); return ESP_FAIL; }
+        remaining -= r;
+    }
+    if (esp_ota_end(h) != ESP_OK) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Image ungueltig"); return ESP_FAIL; }
+    if (esp_ota_set_boot_partition(part) != ESP_OK) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Boot-Partition setzen fehlgeschlagen"); return ESP_FAIL; }
+
+    httpd_resp_sendstr(req, "Update OK - Geraet startet neu ...");
+    ESP_LOGI(TAG, "OTA erfolgreich, Neustart");
+    vTaskDelay(pdMS_TO_TICKS(600));
+    esp_restart();
+    return ESP_OK;
 }
 
 static void start_http(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
+    cfg.stack_size = 8192;   // OTA-Handler braucht mehr Stack
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &cfg) == ESP_OK) {
         httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get };
+        httpd_uri_t ota  = { .uri = "/ota", .method = HTTP_POST, .handler = ota_post };
         httpd_register_uri_handler(server, &root);
+        httpd_register_uri_handler(server, &ota);
         ESP_LOGI(TAG, "HTTP-Server auf 192.168.226.1 gestartet");
     } else {
         ESP_LOGE(TAG, "HTTP-Server-Start fehlgeschlagen");
@@ -178,6 +234,9 @@ void app_main(void)
 
     start_usb_ncm();
     start_http();
+
+    // Diese App gilt jetzt als lauffaehig -> Rollback abbrechen (fuer OTA).
+    esp_ota_mark_app_valid_cancel_rollback();
 
     ESP_LOGI(TAG, "Phase 1 bereit: USB einstecken -> Netzwerkadapter + http://192.168.226.1/");
 }

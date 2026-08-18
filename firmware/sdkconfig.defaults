@@ -13,3 +13,6 @@ CONFIG_LWIP_DHCPS=y
 
 # Etwas groesserer Systemtask-Stack (USB + Netif-Callbacks)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+
+# --- OTA: App-Rollback (fehlerhaftes Update -> Bootloader kehrt zurueck) ---
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
