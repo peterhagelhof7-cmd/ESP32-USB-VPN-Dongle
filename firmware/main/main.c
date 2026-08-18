@@ -38,7 +38,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "phase2"
+#define FW_BUILD_TAG "phase3"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -56,6 +56,7 @@ static char           s_wifi_pass[64];
 static volatile bool  s_wifi_connected;
 static esp_ip4_addr_t s_wifi_ip;
 static int            s_wifi_retry;
+static bool           s_nat_on;
 
 static void led_set(int r, int g, int b)
 {
@@ -235,6 +236,9 @@ static esp_err_t root_get(httpd_req_t *req)
     const char *wstat = s_wifi_connected ? "verbunden"
                         : (s_wifi_ssid[0] ? "verbinde ..." : "nicht konfiguriert");
     const char *wcol  = s_wifi_connected ? "#43d17a" : "#f0a35e";
+    bool routing = s_nat_on && s_wifi_connected;
+    const char *rstat = routing ? "aktiv (NAT)" : (s_nat_on ? "wartet auf WLAN" : "aus");
+    const char *rcol  = routing ? "#43d17a" : "#f0a35e";
 
     static char page[3200];
     snprintf(page, sizeof(page),
@@ -253,6 +257,7 @@ static esp_err_t root_get(httpd_req_t *req)
         "<div class=card><b>WLAN-Uplink</b>"
         "<div style='font-size:13px'>Status: <b style='color:%s'>%s</b></div>"
         "<div style='font-size:13px'>IP vom Router: %s</div>"
+        "<div style='font-size:13px'>Internet-Routing: <b style='color:%s'>%s</b></div>"
         "<button type=button onclick='scan()' style='margin:6px'>Netzwerke suchen</button>"
         "<div id=nets style='font-size:13px;margin:4px 0'></div>"
         "<form method=post action=/wifi>"
@@ -284,7 +289,7 @@ static esp_err_t root_get(httpd_req_t *req)
         "if(x.status==200)setTimeout(function(){location.reload();},5000);};"
         "x.onerror=function(){st.textContent='Fehler beim Upload';};"
         "x.send(file);};</script></body></html>",
-        wcol, wstat, ipbuf, s_wifi_ssid,
+        wcol, wstat, ipbuf, rcol, rstat, s_wifi_ssid,
         app ? app->version : "?", FW_BUILD_TAG,
         esp_ota_get_running_partition()->label);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -496,14 +501,35 @@ static void start_usb_netif(void)
     esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET,
                            ESP_NETIF_IP_ADDRESS_LEASE_TIME, &lease_min, sizeof(lease_min));
 
+    // DHCP-Server soll dem PC einen DNS-Server nennen. 8.8.8.8 ist per NAT
+    // erreichbar; spaeter (Captive-Portal, Phase 4) ersetzen wir das durch den
+    // dongle-eigenen DNS-Forwarder.
+    esp_netif_dns_info_t dns = {
+        .ip = { .type = ESP_IPADDR_TYPE_V4, .u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8") },
+    };
+    esp_netif_set_dns_info(s_usb_netif, ESP_NETIF_DNS_MAIN, &dns);
+    uint8_t offer_dns = 0x02;   // OFFER_DNS -> DNS-Option im DHCP-Angebot aktiv
+    esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET,
+                           ESP_NETIF_DOMAIN_NAME_SERVER, &offer_dns, sizeof(offer_dns));
+
     esp_netif_action_start(s_usb_netif, NULL, 0, NULL);       // netif hoch
     esp_netif_action_connected(s_usb_netif, NULL, 0, NULL);   // Link up (ESP-Seite)
     esp_netif_dhcps_start(s_usb_netif);                       // DHCP-Server an
 
+    // NAPT auf dem USB-(LAN-)Interface: ausgehende Pakete vom PC (192.168.226.x)
+    // werden beim Forwarding auf die WLAN-STA-Adresse ge-SNAT-et (inp->napt-Modell
+    // von lwIP). Muss auf dem INPUT-/internen Interface aktiviert werden.
+    if (esp_netif_napt_enable(s_usb_netif) == ESP_OK) {
+        s_nat_on = true;
+        ESP_LOGI(TAG, "NAPT aktiv auf USB-Interface (Routing PC -> WLAN)");
+    } else {
+        ESP_LOGW(TAG, "NAPT konnte nicht aktiviert werden");
+    }
+
     // WICHTIG: dem HOST "Link up" signalisieren, sonst bleibt der Adapter
     // "Dormant" und Windows/macOS schickt gar kein DHCP.
     tud_network_link_state(0, true);
-    ESP_LOGI(TAG, "USB-netif aktiv: 192.168.226.1/29, DHCP-Server an, Link=up");
+    ESP_LOGI(TAG, "USB-netif aktiv: 192.168.226.1/29, DHCP-Server + DNS + NAT, Link=up");
 }
 
 void app_main(void)
@@ -550,7 +576,7 @@ void app_main(void)
     // Diese App gilt jetzt als lauffaehig -> Rollback abbrechen (fuer OTA).
     esp_ota_mark_app_valid_cancel_rollback();
 
-    ESP_LOGI(TAG, "Phase 2 bereit: USB-NCM + WLAN-STA. netif-RX %s.",
+    ESP_LOGI(TAG, "Phase 3 bereit: USB-NCM + WLAN-STA + NAT/DNS. netif-RX %s.",
              DIAG_NO_NETIF_RX ? "ABGESCHALTET (nur zaehlen)" : "aktiv");
 
     // Diagnose-Heartbeat: solange das hier laeuft, lebt das Geraet.
