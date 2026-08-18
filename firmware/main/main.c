@@ -8,6 +8,7 @@
  * USB-Netzwerkadapter + DHCP + HTTP) validierbar, bevor WLAN/NAT/WireGuard folgen.
  */
 #include <string.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -15,7 +16,9 @@
 #include "esp_system.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_netif.h"
+#include "esp_wifi.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
@@ -34,6 +37,8 @@ static const char *TAG = "usbvpn";
 #define DIAG_NO_NETIF_RX 0
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
+// Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
+#define FW_BUILD_TAG "phase2"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -43,6 +48,14 @@ static volatile uint32_t s_rx_count;
 #define LED_B_PIN GPIO_NUM_7
 
 static esp_netif_t *s_usb_netif;
+
+// --- WLAN-Uplink (STA) Zustand ---
+static esp_netif_t   *s_sta_netif;
+static char           s_wifi_ssid[33];
+static char           s_wifi_pass[64];
+static volatile bool  s_wifi_connected;
+static esp_ip4_addr_t s_wifi_ip;
+static int            s_wifi_retry;
 
 static void led_set(int r, int g, int b)
 {
@@ -123,11 +136,107 @@ static esp_err_t usb_recv_cb(void *buffer, uint16_t len, void *ctx)
     return ESP_OK;
 }
 
+// --- WLAN-Uplink (STA-Client) -----------------------------------------------
+static void wifi_creds_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("wifi", NVS_READONLY, &h) != ESP_OK) return;
+    size_t sl = sizeof(s_wifi_ssid), pl = sizeof(s_wifi_pass);
+    nvs_get_str(h, "ssid", s_wifi_ssid, &sl);
+    nvs_get_str(h, "pass", s_wifi_pass, &pl);
+    nvs_close(h);
+}
+
+static esp_err_t wifi_creds_save(const char *ssid, const char *pass)
+{
+    nvs_handle_t h;
+    esp_err_t e = nvs_open("wifi", NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    nvs_set_str(h, "ssid", ssid);
+    nvs_set_str(h, "pass", pass);
+    e = nvs_commit(h);
+    nvs_close(h);
+    return e;
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        if (s_wifi_ssid[0]) esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_wifi_connected = false;
+        led_set(1, 0, 0);   // rot: keine WLAN-Verbindung
+        if (s_wifi_ssid[0]) {
+            s_wifi_retry++;
+            if (s_wifi_retry <= 3 || (s_wifi_retry % 20) == 0)
+                ESP_LOGW(TAG, "WLAN getrennt, erneuter Versuch #%d", s_wifi_retry);
+            esp_wifi_connect();   // WLAN-Treiber ratenlimitiert selbst
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        s_wifi_ip = ev->ip_info.ip;
+        s_wifi_connected = true;
+        s_wifi_retry = 0;
+        led_set(0, 0, 1);   // blau: WLAN verbunden
+        ESP_LOGI(TAG, "WLAN verbunden, IP " IPSTR, IP2STR(&ev->ip_info.ip));
+    }
+}
+
+// Zugangsdaten uebernehmen (aus Webinterface): speichern + neu verbinden.
+static void wifi_apply(const char *ssid, const char *pass)
+{
+    snprintf(s_wifi_ssid, sizeof(s_wifi_ssid), "%s", ssid);
+    snprintf(s_wifi_pass, sizeof(s_wifi_pass), "%s", pass);
+    wifi_creds_save(s_wifi_ssid, s_wifi_pass);
+
+    wifi_config_t wc = { 0 };
+    memcpy(wc.sta.ssid, s_wifi_ssid, sizeof(wc.sta.ssid));
+    memcpy(wc.sta.password, s_wifi_pass, sizeof(wc.sta.password));
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    s_wifi_retry = 0;
+    esp_wifi_disconnect();
+    esp_wifi_connect();
+    ESP_LOGI(TAG, "Neue WLAN-Config: SSID '%s' -> verbinde", s_wifi_ssid);
+}
+
+static void start_wifi(void)
+{
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    wifi_creds_load();
+    if (s_wifi_ssid[0]) {
+        wifi_config_t wc = { 0 };
+        memcpy(wc.sta.ssid, s_wifi_ssid, sizeof(wc.sta.ssid));
+        memcpy(wc.sta.password, s_wifi_pass, sizeof(wc.sta.password));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+        ESP_LOGI(TAG, "WLAN-Config geladen: SSID '%s'", s_wifi_ssid);
+    } else {
+        ESP_LOGW(TAG, "Keine WLAN-Zugangsdaten -> im Webinterface setzen");
+    }
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
 // --- HTTP-Testseite + OTA-Update --------------------------------------------
 static esp_err_t root_get(httpd_req_t *req)
 {
     const esp_app_desc_t *app = esp_app_get_description();
-    static char page[1600];
+    char ipbuf[16];
+    if (s_wifi_connected) snprintf(ipbuf, sizeof(ipbuf), IPSTR, IP2STR(&s_wifi_ip));
+    else                  snprintf(ipbuf, sizeof(ipbuf), "-");
+    const char *wstat = s_wifi_connected ? "verbunden"
+                        : (s_wifi_ssid[0] ? "verbinde ..." : "nicht konfiguriert");
+    const char *wcol  = s_wifi_connected ? "#43d17a" : "#f0a35e";
+
+    static char page[3200];
     snprintf(page, sizeof(page),
         "<!doctype html><html><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -136,18 +245,38 @@ static esp_err_t root_get(httpd_req_t *req)
         "text-align:center;padding:32px}h1{color:#5cc8ff}.ok{color:#43d17a}"
         ".card{background:#16203c;border:1px solid #33406a;border-radius:10px;"
         "max-width:460px;margin:18px auto;padding:18px}button{padding:8px 16px}"
-        "progress{width:100%%;margin-top:8px}</style></head><body>"
+        "input{padding:6px;border-radius:6px;border:1px solid #33406a;"
+        "background:#0f1626;color:#e6e6e6}progress{width:100%%;margin-top:8px}"
+        "</style></head><body>"
         "<h1>ESP32-USB-VPN-Dongle</h1>"
-        "<p class=ok>Phase 1: USB-NCM funktioniert.</p>"
-        "<p>Der PC hat per DHCP eine IP vom Dongle erhalten und erreicht das "
-        "Webinterface unter <b>192.168.226.1</b>. WLAN / NAT / WireGuard folgen.</p>"
+        "<p class=ok>USB-NCM aktiv - PC per DHCP am Dongle (192.168.226.1).</p>"
+        "<div class=card><b>WLAN-Uplink</b>"
+        "<div style='font-size:13px'>Status: <b style='color:%s'>%s</b></div>"
+        "<div style='font-size:13px'>IP vom Router: %s</div>"
+        "<button type=button onclick='scan()' style='margin:6px'>Netzwerke suchen</button>"
+        "<div id=nets style='font-size:13px;margin:4px 0'></div>"
+        "<form method=post action=/wifi>"
+        "<input name=ssid placeholder=SSID value='%s' style='width:90%%;margin:3px' required><br>"
+        "<input name=pass type=password placeholder=Passwort style='width:90%%;margin:3px'><br>"
+        "<button type=submit>Verbinden / Speichern</button></form></div>"
         "<div class=card><b>Firmware-Update (OTA)</b>"
         "<div style='font-size:13px;color:#8ab4f8'>Version: %s</div>"
+        "<div style='font-size:13px;color:#8ab4f8'>Build: %s</div>"
+        "<div style='font-size:13px;color:#8ab4f8'>Aktive Partition: %s</div>"
         "<form id=f><input type=file id=fw accept='.bin' required>"
         "<button type=submit>Update einspielen</button></form>"
         "<progress id=p max=100 value=0 hidden></progress>"
         "<div id=st style='font-size:13px'></div></div>"
-        "<script>f.onsubmit=function(e){e.preventDefault();var file=fw.files[0];"
+        "<script>"
+        "function scan(){var d=document.getElementById('nets');d.textContent='scanne ...';"
+        "fetch('/scan').then(function(r){return r.json();}).then(function(a){d.innerHTML='';"
+        "a.forEach(function(n){var b=document.createElement('button');b.type='button';"
+        "b.style.cssText='display:block;width:92%%;margin:2px auto';"
+        "b.textContent=(n.lock?'* ':'  ')+n.ssid+' ('+n.rssi+' dBm)';"
+        "b.onclick=function(){document.getElementsByName('ssid')[0].value=n.ssid;};"
+        "d.appendChild(b);});if(!a.length){d.textContent='keine Netze gefunden';}"
+        "}).catch(function(){d.textContent='Scan-Fehler';});}"
+        "f.onsubmit=function(e){e.preventDefault();var file=fw.files[0];"
         "if(!file)return;var x=new XMLHttpRequest();x.open('POST','/ota');"
         "p.hidden=false;x.upload.onprogress=function(ev){var v=Math.round("
         "ev.loaded/ev.total*100);p.value=v;st.textContent=v+'%%';};"
@@ -155,7 +284,9 @@ static esp_err_t root_get(httpd_req_t *req)
         "if(x.status==200)setTimeout(function(){location.reload();},5000);};"
         "x.onerror=function(){st.textContent='Fehler beim Upload';};"
         "x.send(file);};</script></body></html>",
-        app ? app->version : "?");
+        wcol, wstat, ipbuf, s_wifi_ssid,
+        app ? app->version : "?", FW_BUILD_TAG,
+        esp_ota_get_running_partition()->label);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_sendstr(req, page);
 }
@@ -193,6 +324,89 @@ static esp_err_t ota_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// %XX / '+' aus x-www-form-urlencoded dekodieren (in-place-sicher: dst != src).
+static void url_decode(char *dst, const char *src, size_t dst_size)
+{
+    size_t o = 0;
+    for (size_t i = 0; src[i] && o + 1 < dst_size; i++) {
+        if (src[i] == '%' && src[i + 1] && src[i + 2]) {
+            char hex[3] = { src[i + 1], src[i + 2], 0 };
+            dst[o++] = (char)strtol(hex, NULL, 16);
+            i += 2;
+        } else if (src[i] == '+') {
+            dst[o++] = ' ';
+        } else {
+            dst[o++] = src[i];
+        }
+    }
+    dst[o] = 0;
+}
+
+// WLAN-Zugangsdaten aus dem Webformular uebernehmen (ssid=...&pass=...).
+static esp_err_t wifi_post(httpd_req_t *req)
+{
+    char body[256];
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    int r = httpd_req_recv(req, body, len);
+    if (r <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "kein Body"); return ESP_FAIL; }
+    body[r] = 0;
+
+    char ssid_enc[96] = { 0 }, pass_enc[128] = { 0 };
+    char ssid[33] = { 0 }, pass[64] = { 0 };
+    if (httpd_query_key_value(body, "ssid", ssid_enc, sizeof(ssid_enc)) == ESP_OK)
+        url_decode(ssid, ssid_enc, sizeof(ssid));
+    if (httpd_query_key_value(body, "pass", pass_enc, sizeof(pass_enc)) == ESP_OK)
+        url_decode(pass, pass_enc, sizeof(pass));
+
+    if (!ssid[0]) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID fehlt"); return ESP_FAIL; }
+    wifi_apply(ssid, pass);
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_sendstr(req,
+        "<!doctype html><meta charset=utf-8>"
+        "<body style='font-family:sans-serif;background:#0f1626;color:#e6e6e6;"
+        "text-align:center;padding:40px'><h2>Gespeichert - verbinde mit WLAN ...</h2>"
+        "<p><a href='/' style='color:#5cc8ff'>Zurueck zur Statusseite</a></p>"
+        "<script>setTimeout(function(){location.href='/';},4000);</script></body>");
+}
+
+// Verfuegbare WLANs scannen -> JSON [{ssid,rssi,lock}]. Blockierender Scan (~3 s).
+static esp_err_t scan_get(httpd_req_t *req)
+{
+    wifi_scan_config_t sc = { .show_hidden = false };
+    if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Scan fehlgeschlagen");
+        return ESP_FAIL;
+    }
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n > 20) n = 20;
+    wifi_ap_record_t *recs = calloc(n ? n : 1, sizeof(wifi_ap_record_t));
+    if (!recs) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "kein RAM"); return ESP_FAIL; }
+    esp_wifi_scan_get_ap_records(&n, recs);
+
+    static char json[2048];
+    size_t o = 0;
+    o += snprintf(json + o, sizeof(json) - o, "[");
+    for (uint16_t i = 0; i < n && o < sizeof(json) - 96; i++) {
+        char esc[66]; size_t eo = 0;
+        for (const char *p = (const char *)recs[i].ssid; *p && eo < sizeof(esc) - 2; p++) {
+            if (*p == '"' || *p == '\\') esc[eo++] = '\\';
+            esc[eo++] = *p;
+        }
+        esc[eo] = 0;
+        if (esc[0] == 0) continue;   // versteckte SSID ueberspringen
+        int locked = recs[i].authmode != WIFI_AUTH_OPEN;
+        o += snprintf(json + o, sizeof(json) - o,
+                      "%s{\"ssid\":\"%s\",\"rssi\":%d,\"lock\":%d}",
+                      (o > 1 ? "," : ""), esc, recs[i].rssi, locked);
+    }
+    snprintf(json + o, sizeof(json) - o, "]");
+    free(recs);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, json);
+}
+
 static void start_http(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -202,8 +416,12 @@ static void start_http(void)
     if (httpd_start(&server, &cfg) == ESP_OK) {
         httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get };
         httpd_uri_t ota  = { .uri = "/ota", .method = HTTP_POST, .handler = ota_post };
+        httpd_uri_t wifi = { .uri = "/wifi", .method = HTTP_POST, .handler = wifi_post };
+        httpd_uri_t scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get };
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ota);
+        httpd_register_uri_handler(server, &wifi);
+        httpd_register_uri_handler(server, &scan);
         ESP_LOGI(TAG, "HTTP-Server auf 192.168.226.1 gestartet");
     } else {
         ESP_LOGE(TAG, "HTTP-Server-Start fehlgeschlagen");
@@ -326,18 +544,20 @@ void app_main(void)
     }
 
     start_usb_netif();    // dann Subnetz + DHCP (nicht-fatal)
+    start_wifi();          // Phase 2: WLAN-Uplink (STA)
     start_http();
 
     // Diese App gilt jetzt als lauffaehig -> Rollback abbrechen (fuer OTA).
     esp_ota_mark_app_valid_cancel_rollback();
 
-    ESP_LOGI(TAG, "Phase 1 bereit (DIAG). netif-RX %s.",
+    ESP_LOGI(TAG, "Phase 2 bereit: USB-NCM + WLAN-STA. netif-RX %s.",
              DIAG_NO_NETIF_RX ? "ABGESCHALTET (nur zaehlen)" : "aktiv");
 
     // Diagnose-Heartbeat: solange das hier laeuft, lebt das Geraet.
     for (int i = 0;; i++) {
-        ESP_LOGI(TAG, "alive #%d | rx=%u tx=%u | heap=%u B",
+        ESP_LOGI(TAG, "alive #%d | rx=%u tx=%u | wlan=%s | heap=%u B",
                  i, (unsigned)s_rx_count, (unsigned)s_tx_count,
+                 s_wifi_connected ? "up" : "down",
                  (unsigned)esp_get_free_heap_size());
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
