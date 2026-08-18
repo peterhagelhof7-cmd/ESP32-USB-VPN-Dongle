@@ -12,19 +12,29 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_event.h"
+#include "esp_system.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
+#include "esp_core_dump.h"
 #include "driver/gpio.h"
 
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_net.h"
+#include "tinyusb_cdc_acm.h"
+#include "tinyusb_console.h"
 
 static const char *TAG = "usbvpn";
+
+// DIAGNOSE: 1 = USB-Empfang NICHT an esp_netif weiterreichen (nur zaehlen).
+#define DIAG_NO_NETIF_RX 0
+// DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
+#define DIAG_TX_NOOP 0
+static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
 // Verdrahtung anpassen. Phase 1: rot (noch nichts verbunden).
@@ -51,23 +61,65 @@ static void led_init(void)
     led_set(1, 0, 0);   // rot
 }
 
-// --- USB-NCM <-> esp_netif Glue ---------------------------------------------
+// --- USB-NCM <-> esp_netif Glue (dokumentiertes Custom-Driver-Muster) --------
+typedef struct { esp_netif_driver_base_t base; } usb_driver_t;
+static usb_driver_t s_usb_driver;
+
 // esp_netif will senden -> ueber USB an den PC.
-static esp_err_t usbnet_transmit(void *h, void *buffer, size_t len)
+static volatile uint32_t s_tx_count;
+static esp_err_t usb_driver_transmit(void *h, void *buffer, size_t len)
+{
+    (void)h; (void)buffer; (void)len;
+    s_tx_count++;
+#if DIAG_TX_NOOP
+    return ESP_OK;   // DIAGNOSE: TX verwerfen (Deadlock-Test)
+#else
+    return tinyusb_net_send_sync(buffer, len, NULL, pdMS_TO_TICKS(200));
+#endif
+}
+
+// esp_netif hat den RX-pbuf freigegeben -> unsere in usb_recv_cb gemachte Kopie loesen.
+static void usb_driver_free_rx(void *h, void *buffer)
 {
     (void)h;
-    return tinyusb_net_send_sync(buffer, len, NULL, pdMS_TO_TICKS(200));
+    free(buffer);
+}
+
+// Beim Anhaengen des Treibers: netif merken + Transmit registrieren. Dieser
+// Weg (esp_netif_attach + post_attach) verdrahtet den Netstack korrekt --
+// anders als das direkte Setzen von config.driver.
+static esp_err_t usb_driver_post_attach(esp_netif_t *netif, void *args)
+{
+    usb_driver_t *drv = args;
+    drv->base.netif = netif;
+    esp_netif_driver_ifconfig_t ifcfg = {
+        .handle = drv,
+        .transmit = usb_driver_transmit,
+        .driver_free_rx_buffer = usb_driver_free_rx,
+    };
+    return esp_netif_set_driver_config(netif, &ifcfg);
 }
 
 // Vom PC empfangenes USB-Paket -> in den lwIP-Stack des USB-netif einspeisen.
 static esp_err_t usb_recv_cb(void *buffer, uint16_t len, void *ctx)
 {
     (void)ctx;
+    s_rx_count++;
+#if !DIAG_NO_NETIF_RX
     if (s_usb_netif) {
-        // esp_netif_receive kopiert den Puffer (eb == NULL) -> TinyUSB darf ihn
-        // nach Rueckkehr wiederverwenden.
-        esp_netif_receive(s_usb_netif, buffer, len, NULL);
+        // Der ETH-Netstack legt einen zero-copy PBUF_REF auf 'buffer' an und gibt
+        // ihn erst spaeter im tcpip-Task frei (via driver_free_rx_buffer). Der
+        // TinyUSB-Puffer wird aber nach diesem Callback wiederverwendet -> wir
+        // muessen kopieren und die Kopie im free-Callback (usb_driver_free_rx) loesen.
+        void *copy = malloc(len);
+        if (copy) {
+            memcpy(copy, buffer, len);
+            if (esp_netif_receive(s_usb_netif, copy, len, NULL) != ESP_OK) {
+                free(copy);
+            }
+        }
     }
+#endif
     return ESP_OK;
 }
 
@@ -158,55 +210,15 @@ static void start_http(void)
     }
 }
 
-// --- USB-NCM-netif aufsetzen (Router mit eigenem Subnetz + DHCP-Server) ------
-static void start_usb_ncm(void)
+// SCHRITT 1: TinyUSB + NCM zuerst starten, damit USB IMMER enumeriert (auch wenn
+// das netif-Setup spaeter Probleme macht -> wir sehen wenigstens den Adapter).
+static void start_usb(void)
 {
-    // Basis-MAC ableiten; Host- und Geraeteseite muessen sich unterscheiden.
     uint8_t base[6]; esp_efuse_mac_get_default(base);
-    uint8_t host_mac[6], dev_mac[6];
-    memcpy(host_mac, base, 6); memcpy(dev_mac, base, 6);
+    uint8_t host_mac[6];
+    memcpy(host_mac, base, 6);
     host_mac[0] = (host_mac[0] | 0x02) & 0xFE;   // lokal verwaltet, unicast
-    dev_mac[0]  = (dev_mac[0]  | 0x02) & 0xFE;
-    dev_mac[5] ^= 0x01;                           // Geraeteseite abweichend
 
-    // Statische IP 192.168.226.1/29 (ESP = Gateway, kleines Netz = wenige Hosts).
-    esp_netif_ip_info_t ip = { 0 };
-    esp_netif_str_to_ip4("192.168.226.1", &ip.ip);
-    esp_netif_str_to_ip4("192.168.226.1", &ip.gw);
-    esp_netif_str_to_ip4("255.255.255.248", &ip.netmask);
-
-    esp_netif_inherent_config_t base_cfg = {
-        .flags = ESP_NETIF_DHCP_SERVER | ESP_NETIF_FLAG_AUTOUP,
-        .ip_info = &ip,
-        .if_key = "usb_ncm",
-        .if_desc = "usb",
-        .route_prio = 10,
-    };
-    esp_netif_driver_ifconfig_t drv_cfg = {
-        .handle = (void *)1,             // Dummy-Handle (kein echter Treiber noetig)
-        .transmit = usbnet_transmit,
-        .driver_free_rx_buffer = NULL,   // wir uebergeben keine Puffer an den Stack
-    };
-    esp_netif_config_t cfg = {
-        .base = &base_cfg,
-        .driver = &drv_cfg,
-        .stack = ESP_NETIF_NETSTACK_DEFAULT_ETH,   // NCM liefert Ethernet-Frames
-    };
-    s_usb_netif = esp_netif_new(&cfg);
-    assert(s_usb_netif);
-    ESP_ERROR_CHECK(esp_netif_set_mac(s_usb_netif, dev_mac));
-
-    // DHCP-Server: Lease-Zeit 10 min (Option vor dem Start setzen).
-    esp_netif_dhcps_stop(s_usb_netif);
-    uint32_t lease_min = 10;
-    esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET,
-                           ESP_NETIF_IP_ADDRESS_LEASE_TIME, &lease_min, sizeof(lease_min));
-
-    esp_netif_action_start(s_usb_netif, NULL, 0, NULL);       // netif hoch
-    esp_netif_action_connected(s_usb_netif, NULL, 0, NULL);   // Link up
-    esp_netif_dhcps_start(s_usb_netif);                       // DHCP-Server an
-
-    // TinyUSB + NCM starten.
     const tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
     tinyusb_net_config_t net_cfg = {
@@ -216,7 +228,64 @@ static void start_usb_ncm(void)
     };
     memcpy(net_cfg.mac_addr, host_mac, 6);
     ESP_ERROR_CHECK(tinyusb_net_init(&net_cfg));
-    ESP_LOGI(TAG, "USB-NCM aktiv, Subnetz 192.168.226.0/29, ESP = .1");
+
+    // CDC-ACM + Log-Konsole ueber USB (Composite) -> Logs auf zweitem COM-Port.
+    tinyusb_config_cdcacm_t acm = { .cdc_port = TINYUSB_CDC_ACM_0 };
+    if (tinyusb_cdcacm_init(&acm) == ESP_OK) {
+        tinyusb_console_init(TINYUSB_CDC_ACM_0);   // stdout/ESP_LOG -> USB-CDC
+    }
+    ESP_LOGI(TAG, "USB-NCM + CDC-Konsole installiert");
+}
+
+// SCHRITT 2: USB-netif als Router mit eigenem Subnetz + DHCP-Server. NICHT-fatal:
+// falls hier etwas schiefgeht, bleibt USB trotzdem oben (nur ohne DHCP/IP).
+static esp_netif_ip_info_t s_ip;   // static: esp_netif haelt ggf. den Zeiger
+static void start_usb_netif(void)
+{
+    uint8_t base[6]; esp_efuse_mac_get_default(base);
+    uint8_t dev_mac[6];
+    memcpy(dev_mac, base, 6);
+    dev_mac[0] = (dev_mac[0] | 0x02) & 0xFE;
+    dev_mac[5] ^= 0x01;                           // Geraeteseite abweichend vom Host
+
+    esp_netif_str_to_ip4("192.168.226.1", &s_ip.ip);
+    esp_netif_str_to_ip4("192.168.226.1", &s_ip.gw);
+    esp_netif_str_to_ip4("255.255.255.248", &s_ip.netmask);
+
+    esp_netif_inherent_config_t base_cfg = {
+        .flags = ESP_NETIF_DHCP_SERVER | ESP_NETIF_FLAG_AUTOUP,
+        .ip_info = &s_ip,
+        .if_key = "usb_ncm",
+        .if_desc = "usb",
+        .route_prio = 10,
+    };
+    esp_netif_config_t cfg = {
+        .base = &base_cfg,
+        .driver = NULL,                            // Treiber ueber attach (post_attach)
+        .stack = ESP_NETIF_NETSTACK_DEFAULT_ETH,   // NCM liefert Ethernet-Frames
+    };
+    s_usb_netif = esp_netif_new(&cfg);
+    if (!s_usb_netif) { ESP_LOGE(TAG, "esp_netif_new (USB) fehlgeschlagen"); return; }
+    esp_netif_set_mac(s_usb_netif, dev_mac);
+
+    s_usb_driver.base.post_attach = usb_driver_post_attach;
+    if (esp_netif_attach(s_usb_netif, &s_usb_driver) != ESP_OK) {
+        ESP_LOGE(TAG, "esp_netif_attach (USB) fehlgeschlagen"); return;
+    }
+
+    esp_netif_dhcps_stop(s_usb_netif);
+    uint32_t lease_min = 10;   // DHCP-Lease 10 min
+    esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET,
+                           ESP_NETIF_IP_ADDRESS_LEASE_TIME, &lease_min, sizeof(lease_min));
+
+    esp_netif_action_start(s_usb_netif, NULL, 0, NULL);       // netif hoch
+    esp_netif_action_connected(s_usb_netif, NULL, 0, NULL);   // Link up (ESP-Seite)
+    esp_netif_dhcps_start(s_usb_netif);                       // DHCP-Server an
+
+    // WICHTIG: dem HOST "Link up" signalisieren, sonst bleibt der Adapter
+    // "Dormant" und Windows/macOS schickt gar kein DHCP.
+    tud_network_link_state(0, true);
+    ESP_LOGI(TAG, "USB-netif aktiv: 192.168.226.1/29, DHCP-Server an, Link=up");
 }
 
 void app_main(void)
@@ -232,11 +301,44 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    start_usb_ncm();
+    start_usb();         // USB-NCM zuerst -> enumeriert immer
+
+    // DIAGNOSE: Core-Dump des letzten Crashs ueber CDC (COM10) ausgeben.
+    vTaskDelay(pdMS_TO_TICKS(1500));  // CDC/Host-Enum abwarten, sonst Log verloren
+    {
+        esp_core_dump_summary_t *sum = malloc(sizeof(esp_core_dump_summary_t));
+        if (sum && esp_core_dump_get_summary(sum) == ESP_OK) {
+            ESP_LOGE(TAG, "==== CORE-DUMP vom letzten Crash ====");
+            ESP_LOGE(TAG, "PANIC-Task: %s", sum->exc_task);
+            ESP_LOGE(TAG, "exc_pc = 0x%08x", (unsigned)sum->exc_pc);
+            ESP_LOGE(TAG, "Backtrace (depth=%u, corrupted=%d):",
+                     (unsigned)sum->exc_bt_info.depth, (int)sum->exc_bt_info.corrupted);
+            for (uint32_t k = 0; k < sum->exc_bt_info.depth; k++) {
+                ESP_LOGE(TAG, "  #%u  0x%08x", (unsigned)k,
+                         (unsigned)sum->exc_bt_info.bt[k]);
+            }
+            ESP_LOGE(TAG, "==== ENDE CORE-DUMP (wird geloescht) ====");
+            esp_core_dump_image_erase();
+        } else {
+            ESP_LOGI(TAG, "Kein Core-Dump gespeichert.");
+        }
+        free(sum);
+    }
+
+    start_usb_netif();    // dann Subnetz + DHCP (nicht-fatal)
     start_http();
 
     // Diese App gilt jetzt als lauffaehig -> Rollback abbrechen (fuer OTA).
     esp_ota_mark_app_valid_cancel_rollback();
 
-    ESP_LOGI(TAG, "Phase 1 bereit: USB einstecken -> Netzwerkadapter + http://192.168.226.1/");
+    ESP_LOGI(TAG, "Phase 1 bereit (DIAG). netif-RX %s.",
+             DIAG_NO_NETIF_RX ? "ABGESCHALTET (nur zaehlen)" : "aktiv");
+
+    // Diagnose-Heartbeat: solange das hier laeuft, lebt das Geraet.
+    for (int i = 0;; i++) {
+        ESP_LOGI(TAG, "alive #%d | rx=%u tx=%u | heap=%u B",
+                 i, (unsigned)s_rx_count, (unsigned)s_tx_count,
+                 (unsigned)esp_get_free_heap_size());
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
 }
