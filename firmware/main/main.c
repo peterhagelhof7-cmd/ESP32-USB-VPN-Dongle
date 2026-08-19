@@ -20,6 +20,9 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "lwip/sockets.h"
+#include "esp_wireguard.h"
+#include "mbedtls/md.h"
+#include "mbedtls/base64.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
@@ -39,7 +42,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "phase4"
+#define FW_BUILD_TAG "phase8"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -61,6 +64,9 @@ static bool           s_nat_on;
 // Captive-Portal-Zustand: gesperrt (Default) -> kein Internet, DNS-Hijack aufs
 // Dongle-Webinterface; entsperrt -> NAT an, DNS wird echt weitergeleitet.
 static volatile bool  s_unlocked;
+// Kill-Switch (Phase 6): wenn scharf, gibt es Internet nur bei aktivem
+// VPN-Tunnel -> faellt WireGuard weg, wird die Weiterleitung sofort geblockt.
+static volatile bool  s_killswitch;
 
 // Internet-Freigabe an-/ausschalten (NAPT auf dem USB-Interface).
 static void set_internet(bool on)
@@ -154,6 +160,143 @@ static esp_err_t usb_recv_cb(void *buffer, uint16_t len, void *ctx)
     return ESP_OK;
 }
 
+// --- WireGuard-VPN-Tunnel ----------------------------------------------------
+// esp_wireguard haelt nur Zeiger auf die Strings -> persistente Puffer noetig.
+static char s_wg_priv[64];
+static char s_wg_pub[64];
+static char s_wg_psk[64];
+static char s_wg_endpoint[80];
+static char s_wg_addr[24];
+static char s_wg_netmask[24];
+static int  s_wg_port = 51820;
+static int  s_wg_keepalive = 25;
+static bool s_wg_fulltunnel;          // true: ganzen PC-Verkehr durch den Tunnel
+static wireguard_ctx_t s_wg_ctx = ESP_WIREGUARD_CONTEXT_DEFAULT();
+static volatile bool s_wg_up;
+static bool s_wg_started;
+static bool s_wg_default_set;          // WG ist aktuell Default-Route
+static volatile bool s_wg_reconnect;   // Web-Form -> Reconnect im Main-Task
+
+static bool wg_configured(void)
+{
+    return s_wg_priv[0] && s_wg_pub[0] && s_wg_endpoint[0] && s_wg_addr[0];
+}
+
+// LED-Zustand: gruen=VPN, blau=WLAN, rot=nichts.
+static void led_update(void)
+{
+    if (s_wg_up)              led_set(0, 1, 0);
+    else if (s_wifi_connected) led_set(0, 0, 1);
+    else                       led_set(1, 0, 0);
+}
+
+// Zentrale Internet-Freigabe: NAPT nur AN, wenn entsperrt UND (Kill-Switch aus
+// ODER VPN-Tunnel steht). So blockt der Kill-Switch jeden Leak, wenn WG faellt.
+static void update_internet_gate(void)
+{
+    bool allow = s_unlocked && (!s_killswitch || s_wg_up);
+    if (allow != s_nat_on) set_internet(allow);
+}
+
+static void wg_creds_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("wg", NVS_READONLY, &h) != ESP_OK) return;
+    size_t n;
+    n = sizeof(s_wg_priv);     nvs_get_str(h, "priv", s_wg_priv, &n);
+    n = sizeof(s_wg_pub);      nvs_get_str(h, "pub", s_wg_pub, &n);
+    n = sizeof(s_wg_psk);      nvs_get_str(h, "psk", s_wg_psk, &n);
+    n = sizeof(s_wg_endpoint); nvs_get_str(h, "ep", s_wg_endpoint, &n);
+    n = sizeof(s_wg_addr);     nvs_get_str(h, "addr", s_wg_addr, &n);
+    n = sizeof(s_wg_netmask);  nvs_get_str(h, "mask", s_wg_netmask, &n);
+    int32_t v;
+    if (nvs_get_i32(h, "port", &v) == ESP_OK) s_wg_port = v;
+    if (nvs_get_i32(h, "ka", &v) == ESP_OK)   s_wg_keepalive = v;
+    uint8_t b;
+    if (nvs_get_u8(h, "full", &b) == ESP_OK)  s_wg_fulltunnel = b;
+    if (nvs_get_u8(h, "ks", &b) == ESP_OK)    s_killswitch = b;
+    nvs_close(h);
+}
+
+static void wg_creds_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("wg", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, "priv", s_wg_priv);
+    nvs_set_str(h, "pub",  s_wg_pub);
+    nvs_set_str(h, "psk",  s_wg_psk);
+    nvs_set_str(h, "ep",   s_wg_endpoint);
+    nvs_set_str(h, "addr", s_wg_addr);
+    nvs_set_str(h, "mask", s_wg_netmask);
+    nvs_set_i32(h, "port", s_wg_port);
+    nvs_set_i32(h, "ka",   s_wg_keepalive);
+    nvs_set_u8(h,  "full", s_wg_fulltunnel ? 1 : 0);
+    nvs_set_u8(h,  "ks",   s_killswitch ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// Tunnel initialisieren + verbinden (braucht aktives WLAN).
+static void wg_start(void)
+{
+    if (!wg_configured() || !s_wifi_connected || s_wg_started) return;
+
+    static wireguard_config_t cfg;
+    cfg = (wireguard_config_t)ESP_WIREGUARD_CONFIG_DEFAULT();
+    cfg.private_key   = s_wg_priv;
+    cfg.public_key    = s_wg_pub;
+    cfg.preshared_key = s_wg_psk[0] ? s_wg_psk : NULL;
+    cfg.address       = s_wg_addr;
+    cfg.netmask       = s_wg_netmask[0] ? s_wg_netmask : "255.255.255.255";
+    cfg.endpoint      = s_wg_endpoint;
+    cfg.port          = (uint16_t)s_wg_port;
+    cfg.persistent_keepalive = (uint16_t)s_wg_keepalive;
+
+    if (esp_wireguard_init(&cfg, &s_wg_ctx) != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wireguard_init fehlgeschlagen"); return;
+    }
+    if (esp_wireguard_connect(&s_wg_ctx) != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wireguard_connect fehlgeschlagen"); return;
+    }
+    s_wg_started = true;
+    ESP_LOGI(TAG, "WireGuard: init+connect -> %s:%d, Tunnel-IP %s",
+             s_wg_endpoint, s_wg_port, s_wg_addr);
+}
+
+static void wg_stop(void)
+{
+    if (!s_wg_started) return;
+    if (s_wg_default_set) { esp_wireguard_restore_default(&s_wg_ctx); s_wg_default_set = false; }
+    esp_wireguard_disconnect(&s_wg_ctx);
+    s_wg_started = false;
+    s_wg_up = false;
+    led_update();
+}
+
+// Periodischer Status-Check (aus dem Heartbeat) -> peer up? + LED.
+static void wg_poll(void)
+{
+    if (!s_wg_started) return;
+    bool up = (esp_wireguard_peer_is_up(&s_wg_ctx) == ESP_OK);
+    if (up && !s_wg_up)  ESP_LOGI(TAG, "WireGuard: Peer UP (Handshake ok)");
+    if (!up && s_wg_up)  ESP_LOGW(TAG, "WireGuard: Peer DOWN");
+    if (up != s_wg_up) { s_wg_up = up; led_update(); update_internet_gate(); }
+
+    // Volltunnel: WG als Default-Route setzen sobald Peer up (Schalter an),
+    // sonst wiederherstellen. NAPT/Captive steuert weiterhin, OB PC-Verkehr fliesst.
+    if (s_wg_up && s_wg_fulltunnel && !s_wg_default_set) {
+        esp_wireguard_add_allowed_ip(&s_wg_ctx, "0.0.0.0", "0.0.0.0");
+        if (esp_wireguard_set_default(&s_wg_ctx) == ESP_OK) {
+            s_wg_default_set = true;
+            ESP_LOGI(TAG, "Volltunnel aktiv: Default-Route -> WireGuard");
+        }
+    } else if ((!s_wg_up || !s_wg_fulltunnel) && s_wg_default_set) {
+        esp_wireguard_restore_default(&s_wg_ctx);
+        s_wg_default_set = false;
+        ESP_LOGI(TAG, "Volltunnel aus: Default-Route wiederhergestellt");
+    }
+}
+
 // --- WLAN-Uplink (STA-Client) -----------------------------------------------
 static void wifi_creds_load(void)
 {
@@ -184,7 +327,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         if (s_wifi_ssid[0]) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_connected = false;
-        led_set(1, 0, 0);   // rot: keine WLAN-Verbindung
+        led_update();       // rot: keine WLAN-Verbindung
         if (s_wifi_ssid[0]) {
             s_wifi_retry++;
             if (s_wifi_retry <= 3 || (s_wifi_retry % 20) == 0)
@@ -196,8 +339,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_wifi_ip = ev->ip_info.ip;
         s_wifi_connected = true;
         s_wifi_retry = 0;
-        led_set(0, 0, 1);   // blau: WLAN verbunden
+        led_update();       // blau: WLAN verbunden
         ESP_LOGI(TAG, "WLAN verbunden, IP " IPSTR, IP2STR(&ev->ip_info.ip));
+        // WireGuard NICHT hier starten: esp_wireguard_init (DNS+Krypto+netif_add)
+        // ist zu schwer fuer den sys_evt-Task. Der Heartbeat (Main-Task) ruft
+        // wg_start(), sobald WLAN verbunden ist.
     }
 }
 
@@ -243,6 +389,113 @@ static void start_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+// --- Interne Ressourcen (RDP/Link/SSH), Phase 8 ------------------------------
+#define MAX_RES 12
+typedef struct {
+    char     name[40];
+    char     type[6];   // "rdp" | "link" | "ssh"
+    char     addr[96];  // Host oder URL
+    uint16_t port;
+} resource_t;
+static resource_t s_res[MAX_RES];
+static int        s_res_count;
+
+static void res_load(void)
+{
+    nvs_handle_t nh;
+    if (nvs_open("res", NVS_READONLY, &nh) != ESP_OK) return;
+    size_t sz = sizeof(s_res);
+    if (nvs_get_blob(nh, "list", s_res, &sz) == ESP_OK) {
+        int32_t c = 0;
+        nvs_get_i32(nh, "cnt", &c);
+        s_res_count = (c >= 0 && c <= MAX_RES) ? c : 0;
+    }
+    nvs_close(nh);
+}
+
+static void res_save(void)
+{
+    nvs_handle_t nh;
+    if (nvs_open("res", NVS_READWRITE, &nh) != ESP_OK) return;
+    nvs_set_blob(nh, "list", s_res, sizeof(s_res));
+    nvs_set_i32(nh, "cnt", s_res_count);
+    nvs_commit(nh);
+    nvs_close(nh);
+}
+
+// --- Admin-Login (HTTP Basic Auth) + sichere Konfig --------------------------
+// Passwort wird NUR als SHA-256-Hash gespeichert (nie Klartext, nie im Code).
+static char s_admin_user[24] = "admin";
+static char s_admin_phash[65];       // SHA-256-Hex
+static bool s_admin_is_default;      // Default-Passwort aktiv -> Warnung
+
+static void sha256_hex(const char *in, char *out /*[65]*/)
+{
+    unsigned char h[32];
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md(info, (const unsigned char *)in, strlen(in), h);
+    for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", h[i]);
+    out[64] = 0;
+}
+
+static void admin_load(void)
+{
+    nvs_handle_t nh;
+    if (nvs_open("admin", NVS_READONLY, &nh) == ESP_OK) {
+        size_t n = sizeof(s_admin_user);
+        nvs_get_str(nh, "user", s_admin_user, &n);
+        n = sizeof(s_admin_phash);
+        bool have = (nvs_get_str(nh, "phash", s_admin_phash, &n) == ESP_OK && s_admin_phash[0]);
+        nvs_close(nh);
+        if (have) return;
+    }
+    sha256_hex("admin", s_admin_phash);   // Default "admin" -> Warnung
+    s_admin_is_default = true;
+}
+
+static void admin_save(const char *user, const char *pass)
+{
+    if (user[0]) snprintf(s_admin_user, sizeof(s_admin_user), "%s", user);
+    sha256_hex(pass, s_admin_phash);
+    s_admin_is_default = false;
+    nvs_handle_t nh;
+    if (nvs_open("admin", NVS_READWRITE, &nh) == ESP_OK) {
+        nvs_set_str(nh, "user", s_admin_user);
+        nvs_set_str(nh, "phash", s_admin_phash);
+        nvs_commit(nh);
+        nvs_close(nh);
+    }
+}
+
+static bool check_basic_auth(httpd_req_t *req)
+{
+    char hdr[160];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) != ESP_OK) return false;
+    if (strncmp(hdr, "Basic ", 6) != 0) return false;
+    unsigned char dec[128]; size_t dl = 0;
+    if (mbedtls_base64_decode(dec, sizeof(dec) - 1, &dl,
+                              (unsigned char *)hdr + 6, strlen(hdr + 6)) != 0) return false;
+    dec[dl] = 0;
+    char *colon = strchr((char *)dec, ':');
+    if (!colon) return false;
+    *colon = 0;
+    if (strcmp((char *)dec, s_admin_user) != 0) return false;
+    char h[65];
+    sha256_hex(colon + 1, h);
+    return strcmp(h, s_admin_phash) == 0;
+}
+
+// true = autorisiert; false = 401 gesendet (Handler soll ESP_OK zurueckgeben).
+static bool require_auth(httpd_req_t *req)
+{
+    if (check_basic_auth(req)) return true;
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32-USB-VPN\"");
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_sendstr(req, "Anmeldung erforderlich");
+    return false;
+}
+
 // --- HTTP-Testseite + OTA-Update --------------------------------------------
 static esp_err_t root_get(httpd_req_t *req)
 {
@@ -263,8 +516,42 @@ static esp_err_t root_get(httpd_req_t *req)
     const char *zbtn  = s_unlocked
         ? "<form method=post action=/lock><button type=submit>Sperren</button></form>"
         : "<form method=post action=/unlock><button type=submit>Anmelden (Internet freigeben)</button></form>";
+    const char *wgcol  = s_wg_up ? "#43d17a" : "#f0a35e";
+    const char *wgstat = s_wg_up ? "verbunden (Handshake ok)"
+        : (wg_configured() ? (s_wg_started ? "verbinde ..." : "wartet auf WLAN") : "nicht konfiguriert");
+    const char *wgmode = s_wg_default_set ? "Volltunnel aktiv (Default-Route)"
+        : (s_wg_fulltunnel ? "Volltunnel gewuenscht (wartet auf Peer)" : "nur Tunnel (kein Routing)");
+    const char *wgfull_chk = s_wg_fulltunnel ? "checked" : "";
+    const char *ks_chk  = s_killswitch ? "checked" : "";
+    const char *ksstat  = s_killswitch ? "scharf (Internet nur mit VPN)" : "aus";
+    const char *kscol   = s_killswitch ? "#43d17a" : "#8ab4f8";
+    const char *pwwarn  = s_admin_is_default
+        ? "<p style='color:#ff6b6b;font-weight:bold'>Standard-Passwort aktiv (admin/admin) - bitte aendern!</p>"
+        : "";
 
-    static char page[3600];
+    // Ressourcenliste (RDP/Link/SSH) rendern.
+    static char reslist[2400];
+    size_t ro = 0; reslist[0] = 0;
+    for (int i = 0; i < s_res_count; i++) {
+        resource_t *r = &s_res[i];
+        char action[160];
+        if (strcmp(r->type, "link") == 0)
+            snprintf(action, sizeof(action), "<a href='%s' target=_blank style='color:#5cc8ff'>Oeffnen</a>", r->addr);
+        else if (strcmp(r->type, "ssh") == 0)
+            snprintf(action, sizeof(action), "<a href='ssh://%s' style='color:#5cc8ff'>SSH</a>", r->addr);
+        else
+            snprintf(action, sizeof(action), "<a href='/rdp?i=%d' style='color:#5cc8ff'>RDP herunterladen</a>", i);
+        ro += snprintf(reslist + ro, sizeof(reslist) - ro,
+            "<div style='border-top:1px solid #33406a;padding:4px;font-size:13px'>"
+            "<b>%s</b> <span style='color:#8ab4f8'>[%s]</span><br>%s &nbsp; %s "
+            "<form method=post action=/resdel style='display:inline'>"
+            "<input type=hidden name=i value=%d><button style='font-size:11px'>loeschen</button></form></div>",
+            r->name, r->type, r->addr, action, i);
+    }
+    if (s_res_count == 0)
+        snprintf(reslist, sizeof(reslist), "<div style='font-size:13px;color:#8ab4f8'>keine Ressourcen</div>");
+
+    static char page[9400];
     snprintf(page, sizeof(page),
         "<!doctype html><html><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -279,6 +566,7 @@ static esp_err_t root_get(httpd_req_t *req)
         "<h1>ESP32-USB-VPN-Dongle</h1>"
         "<p class=ok>USB-NCM aktiv - PC per DHCP am Dongle (192.168.226.1).</p>"
         "%s"   /* Sperr-Banner */
+        "%s"   /* Passwort-Warnung */
         "<div class=card><b>Zugang</b>"
         "<div style='font-size:13px'>Status: <b style='color:%s'>%s</b></div>"
         "%s</div>"
@@ -292,6 +580,39 @@ static esp_err_t root_get(httpd_req_t *req)
         "<input name=ssid placeholder=SSID value='%s' style='width:90%%;margin:3px' required><br>"
         "<input name=pass type=password placeholder=Passwort style='width:90%%;margin:3px'><br>"
         "<button type=submit>Verbinden / Speichern</button></form></div>"
+        "<div class=card><b>WireGuard-VPN</b>"
+        "<div style='font-size:13px'>Tunnel: <b style='color:%s'>%s</b></div>"
+        "<div style='font-size:13px'>Endpoint: %s:%d</div>"
+        "<div style='font-size:13px'>Routing: %s</div>"
+        "<div style='font-size:13px'>Kill-Switch: <b style='color:%s'>%s</b></div>"
+        "<form method=post action=/wg style='font-size:13px'>"
+        "<input name=priv type=password placeholder='Private Key (leer=unveraendert)' style='width:90%%;margin:2px'><br>"
+        "<input name=pub placeholder='Peer Public Key' value='%s' style='width:90%%;margin:2px' required><br>"
+        "<input name=psk type=password placeholder='Preshared Key (optional)' style='width:90%%;margin:2px'><br>"
+        "<input name=ep placeholder='Endpoint Host/IP' value='%s' style='width:58%%;margin:2px' required>"
+        "<input name=port placeholder=Port value='%d' style='width:28%%;margin:2px'><br>"
+        "<input name=addr placeholder='Tunnel-IP z.B. 10.0.0.2' value='%s' style='width:58%%;margin:2px' required>"
+        "<input name=mask placeholder=Maske value='%s' style='width:28%%;margin:2px'><br>"
+        "<input name=ka placeholder='Keepalive s' value='%d' style='width:40%%;margin:2px'><br>"
+        "<label><input type=checkbox name=full value=1 %s> Volltunnel (ganzer PC-Verkehr durch VPN)</label><br>"
+        "<label><input type=checkbox name=ks value=1 %s> Kill-Switch (kein Internet ohne VPN)</label><br>"
+        "<button type=submit>Tunnel speichern + verbinden</button></form></div>"
+        "<div class=card><b>Admin-Zugang</b>"
+        "<div style='font-size:13px'>Benutzer: %s</div>"
+        "<form method=post action=/admin style='font-size:13px'>"
+        "<input name=user placeholder='Benutzer (optional)' value='%s' style='width:90%%;margin:2px'><br>"
+        "<input name=pass type=password placeholder='Neues Passwort' style='width:90%%;margin:2px' required><br>"
+        "<button type=submit>Passwort speichern</button></form></div>"
+        "<div class=card><b>Interne Ressourcen</b>"
+        "%s"
+        "<form method=post action=/res style='font-size:13px'>"
+        "<input name=name placeholder=Name style='width:90%%;margin:2px' required><br>"
+        "<select name=type style='margin:2px'>"
+        "<option value=rdp>RDP</option><option value=link>Link</option><option value=ssh>SSH</option>"
+        "</select> "
+        "<input name=addr placeholder='Adresse / URL' style='width:50%%;margin:2px' required>"
+        "<input name=port placeholder=Port style='width:18%%;margin:2px'><br>"
+        "<button type=submit>Ressource hinzufuegen</button></form></div>"
         "<div class=card><b>Firmware-Update (OTA)</b>"
         "<div style='font-size:13px;color:#8ab4f8'>Version: %s</div>"
         "<div style='font-size:13px;color:#8ab4f8'>Build: %s</div>"
@@ -317,8 +638,11 @@ static esp_err_t root_get(httpd_req_t *req)
         "if(x.status==200)setTimeout(function(){location.reload();},5000);};"
         "x.onerror=function(){st.textContent='Fehler beim Upload';};"
         "x.send(file);};</script></body></html>",
-        lockbanner, zcol, ztext, zbtn,
+        lockbanner, pwwarn, zcol, ztext, zbtn,
         wcol, wstat, ipbuf, rcol, rstat, s_wifi_ssid,
+        wgcol, wgstat, s_wg_endpoint, s_wg_port, wgmode, kscol, ksstat, s_wg_pub,
+        s_wg_endpoint, s_wg_port, s_wg_addr, s_wg_netmask, s_wg_keepalive, wgfull_chk, ks_chk,
+        s_admin_user, s_admin_user, reslist,
         app ? app->version : "?", FW_BUILD_TAG,
         esp_ota_get_running_partition()->label);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -329,6 +653,7 @@ static esp_err_t root_get(httpd_req_t *req)
 // (Phase 1: ohne Auth — wird in Phase 7 auf Admin beschraenkt.)
 static esp_err_t ota_post(httpd_req_t *req)
 {
+    if (!require_auth(req)) return ESP_OK;
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "keine OTA-Partition"); return ESP_FAIL; }
 
@@ -379,6 +704,7 @@ static void url_decode(char *dst, const char *src, size_t dst_size)
 // WLAN-Zugangsdaten aus dem Webformular uebernehmen (ssid=...&pass=...).
 static esp_err_t wifi_post(httpd_req_t *req)
 {
+    if (!require_auth(req)) return ESP_OK;
     char body[256];
     int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
     int r = httpd_req_recv(req, body, len);
@@ -404,9 +730,104 @@ static esp_err_t wifi_post(httpd_req_t *req)
         "<script>setTimeout(function(){location.href='/';},4000);</script></body>");
 }
 
+// Admin-Zugang aendern (Benutzer optional, Passwort erforderlich).
+static esp_err_t admin_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[256];
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    int r = httpd_req_recv(req, body, len);
+    if (r <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "kein Body"); return ESP_FAIL; }
+    body[r] = 0;
+    char enc[128], user[24] = {0}, pass[64] = {0};
+    if (httpd_query_key_value(body, "user", enc, sizeof(enc)) == ESP_OK) url_decode(user, enc, sizeof(user));
+    if (httpd_query_key_value(body, "pass", enc, sizeof(enc)) == ESP_OK) url_decode(pass, enc, sizeof(pass));
+    if (!pass[0]) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Passwort fehlt"); return ESP_FAIL; }
+    admin_save(user[0] ? user : s_admin_user, pass);
+    ESP_LOGI(TAG, "Admin-Zugang geaendert (User '%s')", s_admin_user);
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_sendstr(req, "");
+}
+
+// RDP-Datei fuer Ressource i dynamisch erzeugen + zum Download ausliefern.
+// (offen: nutzerseitig; Adressliste ist ohnehin auf der Statusseite sichtbar)
+static esp_err_t rdp_get(httpd_req_t *req)
+{
+    char q[24]; int idx = -1;
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        char v[8];
+        if (httpd_query_key_value(q, "i", v, sizeof(v)) == ESP_OK) idx = atoi(v);
+    }
+    if (idx < 0 || idx >= s_res_count) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unbekannt"); return ESP_FAIL; }
+    resource_t *r = &s_res[idx];
+    int port = r->port ? r->port : 3389;
+    static char rdp[512];
+    snprintf(rdp, sizeof(rdp),
+        "full address:s:%s:%d\r\n"
+        "prompt for credentials:i:1\r\n"
+        "screen mode id:i:2\r\n"
+        "administrative session:i:0\r\n",
+        r->addr, port);
+    char disp[96];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"%s.rdp\"", r->name);
+    httpd_resp_set_type(req, "application/x-rdp");
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+    return httpd_resp_sendstr(req, rdp);
+}
+
+// Ressource hinzufuegen (Admin).
+static esp_err_t res_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[320];
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    int rr = httpd_req_recv(req, body, len);
+    if (rr <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "kein Body"); return ESP_FAIL; }
+    body[rr] = 0;
+    char enc[128];
+    resource_t r = {0};
+    if (httpd_query_key_value(body, "name", enc, sizeof(enc)) == ESP_OK) url_decode(r.name, enc, sizeof(r.name));
+    if (httpd_query_key_value(body, "type", enc, sizeof(enc)) == ESP_OK) url_decode(r.type, enc, sizeof(r.type));
+    if (httpd_query_key_value(body, "addr", enc, sizeof(enc)) == ESP_OK) url_decode(r.addr, enc, sizeof(r.addr));
+    if (httpd_query_key_value(body, "port", enc, sizeof(enc)) == ESP_OK) r.port = (uint16_t)atoi(enc);
+    if (!r.type[0]) strcpy(r.type, "rdp");
+    if (r.name[0] && r.addr[0] && s_res_count < MAX_RES) {
+        s_res[s_res_count++] = r;
+        res_save();
+        ESP_LOGI(TAG, "Ressource hinzugefuegt: %s (%s)", r.name, r.type);
+    }
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_sendstr(req, "");
+}
+
+// Ressource i loeschen (Admin).
+static esp_err_t resdel_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[48];
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    int rr = httpd_req_recv(req, body, len);
+    if (rr > 0) {
+        body[rr] = 0;
+        char v[8]; int idx = -1;
+        if (httpd_query_key_value(body, "i", v, sizeof(v)) == ESP_OK) idx = atoi(v);
+        if (idx >= 0 && idx < s_res_count) {
+            for (int k = idx; k < s_res_count - 1; k++) s_res[k] = s_res[k + 1];
+            s_res_count--;
+            res_save();
+        }
+    }
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_sendstr(req, "");
+}
+
 // Verfuegbare WLANs scannen -> JSON [{ssid,rssi,lock}]. Blockierender Scan (~3 s).
 static esp_err_t scan_get(httpd_req_t *req)
 {
+    if (!require_auth(req)) return ESP_OK;
     wifi_scan_config_t sc = { .show_hidden = false };
     if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Scan fehlgeschlagen");
@@ -444,6 +865,10 @@ static esp_err_t scan_get(httpd_req_t *req)
 // --- DNS-Server: Captive-Hijack (gesperrt) / Weiterleitung (entsperrt) --------
 static uint32_t upstream_dns_addr(void)
 {
+    // Volltunnel aktiv: der STA-DNS liegt im lokalen WLAN und ist ueber die
+    // WG-Default-Route nicht erreichbar -> oeffentlichen Resolver nehmen, der
+    // durch den Tunnel geht.
+    if (s_wg_default_set) return esp_ip4addr_aton("1.1.1.1");
     esp_netif_dns_info_t d;
     if (s_sta_netif && esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &d) == ESP_OK
         && d.ip.u_addr.ip4.addr != 0) {
@@ -512,6 +937,9 @@ static void dns_server_task(void *arg)
         struct sockaddr_in cli; socklen_t cl = sizeof(cli);
         int len = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&cli, &cl);
         if (len < 12) continue;
+        // Firewall: nur Clients aus dem USB-Subnetz 192.168.226.0/29 bedienen
+        // (kein offener Resolver Richtung WLAN-Netz).
+        if ((ntohl(cli.sin_addr.s_addr) & 0xFFFFFFF8u) != 0xC0A8E200u) continue;
         if (s_unlocked) dns_forward(sock, buf, len, &cli, cl);
         else            dns_hijack(sock, buf, len, &cli, cl);
     }
@@ -540,8 +968,9 @@ static esp_err_t captive_redirect(httpd_req_t *req)
 
 static esp_err_t unlock_post(httpd_req_t *req)
 {
+    if (!require_auth(req)) return ESP_OK;
     s_unlocked = true;
-    set_internet(true);
+    update_internet_gate();
     ESP_LOGI(TAG, "Captive-Portal ENTSPERRT");
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "/");
@@ -550,9 +979,56 @@ static esp_err_t unlock_post(httpd_req_t *req)
 
 static esp_err_t lock_post(httpd_req_t *req)
 {
+    if (!require_auth(req)) return ESP_OK;
     s_unlocked = false;
-    set_internet(false);
+    update_internet_gate();
     ESP_LOGI(TAG, "Captive-Portal GESPERRT");
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_sendstr(req, "");
+}
+
+// WireGuard-Konfiguration aus dem Webformular uebernehmen + neu verbinden.
+static esp_err_t wg_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[512];
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    int r = httpd_req_recv(req, body, len);
+    if (r <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "kein Body"); return ESP_FAIL; }
+    body[r] = 0;
+
+    char enc[128], dec[96];
+#define WG_GETF(key, dst) do { \
+        if (httpd_query_key_value(body, key, enc, sizeof(enc)) == ESP_OK) { \
+            url_decode(dec, enc, sizeof(dec)); strlcpy(dst, dec, sizeof(dst)); } \
+    } while (0)
+    // Secrets (priv/psk) NUR ueberschreiben, wenn eingegeben -> leeres Feld
+    // behaelt den bestehenden Key (Toggles ohne Key-Neueingabe moeglich).
+#define WG_GETSEC(key, dst) do { \
+        if (httpd_query_key_value(body, key, enc, sizeof(enc)) == ESP_OK) { \
+            url_decode(dec, enc, sizeof(dec)); if (dec[0]) strlcpy(dst, dec, sizeof(dst)); } \
+    } while (0)
+    WG_GETSEC("priv", s_wg_priv);
+    WG_GETF("pub",  s_wg_pub);
+    WG_GETSEC("psk",  s_wg_psk);
+    WG_GETF("ep",   s_wg_endpoint);
+    WG_GETF("addr", s_wg_addr);
+    WG_GETF("mask", s_wg_netmask);
+    if (httpd_query_key_value(body, "port", enc, sizeof(enc)) == ESP_OK) s_wg_port = atoi(enc);
+    if (httpd_query_key_value(body, "ka",   enc, sizeof(enc)) == ESP_OK) s_wg_keepalive = atoi(enc);
+    // Checkboxen: nur im Body, wenn angehakt.
+    s_wg_fulltunnel = (httpd_query_key_value(body, "full", enc, sizeof(enc)) == ESP_OK);
+    s_killswitch    = (httpd_query_key_value(body, "ks",   enc, sizeof(enc)) == ESP_OK);
+#undef WG_GETF
+#undef WG_GETSEC
+    wg_creds_save();
+    ESP_LOGI(TAG, "WireGuard-Config gespeichert -> reconnect angefordert");
+
+    // Reconnect NICHT hier (HTTPD-Task, kleiner Stack) -> Main-Task erledigt es.
+    s_wg_reconnect = true;
+    update_internet_gate();   // Kill-Switch-Aenderung sofort anwenden
+
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "/");
     return httpd_resp_sendstr(req, "");
@@ -563,7 +1039,7 @@ static void start_http(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
     cfg.stack_size = 8192;   // OTA-Handler braucht mehr Stack
-    cfg.max_uri_handlers = 10;
+    cfg.max_uri_handlers = 16;
     cfg.uri_match_fn = httpd_uri_match_wildcard;   // fuer Catch-all "/*"
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &cfg) == ESP_OK) {
@@ -573,6 +1049,11 @@ static void start_http(void)
         httpd_uri_t scan   = { .uri = "/scan",   .method = HTTP_GET,  .handler = scan_get };
         httpd_uri_t unlock = { .uri = "/unlock", .method = HTTP_POST, .handler = unlock_post };
         httpd_uri_t lock   = { .uri = "/lock",   .method = HTTP_POST, .handler = lock_post };
+        httpd_uri_t wg     = { .uri = "/wg",      .method = HTTP_POST, .handler = wg_post };
+        httpd_uri_t admin  = { .uri = "/admin",   .method = HTTP_POST, .handler = admin_post };
+        httpd_uri_t rdp    = { .uri = "/rdp",     .method = HTTP_GET,  .handler = rdp_get };
+        httpd_uri_t res    = { .uri = "/res",     .method = HTTP_POST, .handler = res_post };
+        httpd_uri_t resdel = { .uri = "/resdel",  .method = HTTP_POST, .handler = resdel_post };
         httpd_uri_t any    = { .uri = "/*",      .method = HTTP_GET,  .handler = captive_redirect };
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ota);
@@ -580,6 +1061,11 @@ static void start_http(void)
         httpd_register_uri_handler(server, &scan);
         httpd_register_uri_handler(server, &unlock);
         httpd_register_uri_handler(server, &lock);
+        httpd_register_uri_handler(server, &wg);
+        httpd_register_uri_handler(server, &admin);
+        httpd_register_uri_handler(server, &rdp);
+        httpd_register_uri_handler(server, &res);
+        httpd_register_uri_handler(server, &resdel);
         httpd_register_uri_handler(server, &any);   // muss ZULETZT registriert werden
         ESP_LOGI(TAG, "HTTP-Server auf 192.168.226.1 gestartet");
     } else {
@@ -716,6 +1202,9 @@ void app_main(void)
         free(sum);
     }
 
+    wg_creds_load();      // Phase 5: WireGuard-Config aus NVS (vor WLAN-GOT_IP)
+    admin_load();          // Phase 7: Admin-Zugang aus NVS (Default admin/admin)
+    res_load();            // Phase 8: interne Ressourcen aus NVS
     start_usb_netif();    // dann Subnetz + DHCP (nicht-fatal)
     start_wifi();          // Phase 2: WLAN-Uplink (STA)
     start_dns();           // Phase 4: DNS-Server (Captive-Hijack / Weiterleitung)
@@ -724,14 +1213,18 @@ void app_main(void)
     // Diese App gilt jetzt als lauffaehig -> Rollback abbrechen (fuer OTA).
     esp_ota_mark_app_valid_cancel_rollback();
 
-    ESP_LOGI(TAG, "Phase 4 bereit: USB-NCM + WLAN + NAT/DNS + Captive-Portal. netif-RX %s.",
+    ESP_LOGI(TAG, "Phase 8 bereit: + Kill-Switch + Admin-Login + Ressourcen. netif-RX %s.",
              DIAG_NO_NETIF_RX ? "ABGESCHALTET (nur zaehlen)" : "aktiv");
 
     // Diagnose-Heartbeat: solange das hier laeuft, lebt das Geraet.
     for (int i = 0;; i++) {
-        ESP_LOGI(TAG, "alive #%d | rx=%u tx=%u | wlan=%s | heap=%u B",
+        if (s_wg_reconnect) { s_wg_reconnect = false; wg_stop(); }  // Config-Wechsel
+        wg_poll();          // WireGuard-Peer-Status pruefen (+ LED)
+        // WLAN da, WG aber noch nicht gestartet (bzw. nach Reconnect)? -> starten.
+        if (s_wifi_connected && wg_configured() && !s_wg_started) wg_start();
+        ESP_LOGI(TAG, "alive #%d | rx=%u tx=%u | wlan=%s vpn=%s | heap=%u B",
                  i, (unsigned)s_rx_count, (unsigned)s_tx_count,
-                 s_wifi_connected ? "up" : "down",
+                 s_wifi_connected ? "up" : "down", s_wg_up ? "up" : "down",
                  (unsigned)esp_get_free_heap_size());
         vTaskDelay(pdMS_TO_TICKS(2000));
     }

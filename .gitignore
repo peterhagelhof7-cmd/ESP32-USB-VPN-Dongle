@@ -10,3 +10,7 @@ firmware/build/
 # Editor
 .vscode/
 *.swp
+
+# Geheimnisse - NIEMALS committen (WireGuard-Keys etc.)
+*.conf
+wg_config.conf

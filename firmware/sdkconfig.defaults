@@ -14,8 +14,17 @@ CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
 CONFIG_LWIP_DHCPS=y
 
-# Etwas groesserer Systemtask-Stack (USB + Netif-Callbacks)
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+# Groesserer Main-Task-Stack: der Heartbeat startet WireGuard (esp_wireguard_init
+# macht DNS-Aufloesung + Krypto) -> 4096 reicht nicht (wie ESP-BMC).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# WICHTIG fuer WireGuard: droscy/esp_wireguard legt sein netif per rohem
+# lwIP netif_add() an (netif->state = wireguardif). Ohne diese Option nutzt
+# esp_netif netif->state zur esp_netif-Zuordnung -> der globale DHCP-Callback
+# haelt das WG-netif faelschlich fuer ein esp_netif und crasht (LoadProhibited).
+# ESP_NETIF_BRIDGE_EN schaltet LWIP_ESP_NETIF_DATA=1 -> esp_netif nutzt
+# netif->client_data, das WG-netif liefert dort NULL und wird sauber uebersprungen.
+CONFIG_ESP_NETIF_BRIDGE_EN=y
 
 # --- OTA: App-Rollback (fehlerhaftes Update -> Bootloader kehrt zurueck) ---
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
