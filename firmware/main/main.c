@@ -20,6 +20,9 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "lwip/sockets.h"
+#include "lwip/inet.h"
+#include "lwip/netif.h"
+#include "ping/ping_sock.h"
 #include "esp_wireguard.h"
 #include "mbedtls/md.h"
 #include "mbedtls/base64.h"
@@ -42,7 +45,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "phase8"
+#define FW_BUILD_TAG "wg-fixed"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -176,6 +179,7 @@ static volatile bool s_wg_up;
 static bool s_wg_started;
 static bool s_wg_default_set;          // WG ist aktuell Default-Route
 static volatile bool s_wg_reconnect;   // Web-Form -> Reconnect im Main-Task
+static volatile bool s_vpn_off;        // Admin-Schalter "VPN-AUS": Tunnel deaktiviert, kein Reconnect
 
 static bool wg_configured(void)
 {
@@ -215,6 +219,7 @@ static void wg_creds_load(void)
     uint8_t b;
     if (nvs_get_u8(h, "full", &b) == ESP_OK)  s_wg_fulltunnel = b;
     if (nvs_get_u8(h, "ks", &b) == ESP_OK)    s_killswitch = b;
+    if (nvs_get_u8(h, "off", &b) == ESP_OK)   s_vpn_off = b;
     nvs_close(h);
 }
 
@@ -232,6 +237,7 @@ static void wg_creds_save(void)
     nvs_set_i32(h, "ka",   s_wg_keepalive);
     nvs_set_u8(h,  "full", s_wg_fulltunnel ? 1 : 0);
     nvs_set_u8(h,  "ks",   s_killswitch ? 1 : 0);
+    nvs_set_u8(h,  "off",  s_vpn_off ? 1 : 0);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -525,6 +531,13 @@ static esp_err_t root_get(httpd_req_t *req)
     const char *ks_chk  = s_killswitch ? "checked" : "";
     const char *ksstat  = s_killswitch ? "scharf (Internet nur mit VPN)" : "aus";
     const char *kscol   = s_killswitch ? "#43d17a" : "#8ab4f8";
+    const char *vpncol  = s_vpn_off ? "#ff6b6b" : "#43d17a";
+    const char *vpntext = s_vpn_off ? "AUS (Tunnel deaktiviert)" : "AN";
+    const char *vpnbtn  = s_vpn_off
+        ? "<form method=post action=/vpn><input type=hidden name=state value=on>"
+          "<button type=submit>VPN einschalten</button></form>"
+        : "<form method=post action=/vpn><input type=hidden name=state value=off>"
+          "<button type=submit>VPN ausschalten</button></form>";
     const char *pwwarn  = s_admin_is_default
         ? "<p style='color:#ff6b6b;font-weight:bold'>Standard-Passwort aktiv (admin/admin) - bitte aendern!</p>"
         : "";
@@ -551,7 +564,7 @@ static esp_err_t root_get(httpd_req_t *req)
     if (s_res_count == 0)
         snprintf(reslist, sizeof(reslist), "<div style='font-size:13px;color:#8ab4f8'>keine Ressourcen</div>");
 
-    static char page[9400];
+    static char page[9800];
     snprintf(page, sizeof(page),
         "<!doctype html><html><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -585,6 +598,8 @@ static esp_err_t root_get(httpd_req_t *req)
         "<div style='font-size:13px'>Endpoint: %s:%d</div>"
         "<div style='font-size:13px'>Routing: %s</div>"
         "<div style='font-size:13px'>Kill-Switch: <b style='color:%s'>%s</b></div>"
+        "<div style='font-size:13px'>VPN-Schalter: <b style='color:%s'>%s</b></div>"
+        "%s"   /* VPN an/aus (nur Admin) */
         "<form method=post action=/wg style='font-size:13px'>"
         "<input name=priv type=password placeholder='Private Key (leer=unveraendert)' style='width:90%%;margin:2px'><br>"
         "<input name=pub placeholder='Peer Public Key' value='%s' style='width:90%%;margin:2px' required><br>"
@@ -640,7 +655,8 @@ static esp_err_t root_get(httpd_req_t *req)
         "x.send(file);};</script></body></html>",
         lockbanner, pwwarn, zcol, ztext, zbtn,
         wcol, wstat, ipbuf, rcol, rstat, s_wifi_ssid,
-        wgcol, wgstat, s_wg_endpoint, s_wg_port, wgmode, kscol, ksstat, s_wg_pub,
+        wgcol, wgstat, s_wg_endpoint, s_wg_port, wgmode, kscol, ksstat,
+        vpncol, vpntext, vpnbtn, s_wg_pub,
         s_wg_endpoint, s_wg_port, s_wg_addr, s_wg_netmask, s_wg_keepalive, wgfull_chk, ks_chk,
         s_admin_user, s_admin_user, reslist,
         app ? app->version : "?", FW_BUILD_TAG,
@@ -966,6 +982,113 @@ static esp_err_t captive_redirect(httpd_req_t *req)
     return httpd_resp_sendstr(req, "not found");
 }
 
+// --- DIAGNOSE (Phase-5-Data-Plane) ------------------------------------------
+// ICMP-Ping vom Geraet SELBST durch den Tunnel. Quelle = WG-Tunnel-IP
+// (10.10.0.2), NAPT der weitergeleiteten PC-Pakete ist dabei NICHT im
+// Spiel -> trennt "FritzBox verwirft Data-Plane" (dann auch dieser Ping tot)
+// von "Dongle-SNAT der Forward-Pakete falsch" (dann antwortet dieser Ping).
+// GET /diag?ip=<ziel>[&if=wg|any] -> Ergebnis im CDC-Log.
+static void diag_ping_success(esp_ping_handle_t hdl, void *args)
+{
+    uint8_t ttl = 0; uint16_t seqno = 0; uint32_t elapsed = 0; ip_addr_t addr;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO,  &seqno,   sizeof(seqno));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TTL,    &ttl,     sizeof(ttl));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_IPADDR, &addr,    sizeof(addr));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP,&elapsed, sizeof(elapsed));
+    ESP_LOGI(TAG, "DIAG-PING: REPLY von %s seq=%u ttl=%u zeit=%ums",
+             ipaddr_ntoa(&addr), seqno, ttl, (unsigned)elapsed);
+}
+static void diag_ping_timeout(esp_ping_handle_t hdl, void *args)
+{
+    uint16_t seqno = 0; ip_addr_t addr;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO,  &seqno, sizeof(seqno));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_IPADDR, &addr,  sizeof(addr));
+    ESP_LOGW(TAG, "DIAG-PING: TIMEOUT %s seq=%u", ipaddr_ntoa(&addr), seqno);
+}
+static void diag_ping_end(esp_ping_handle_t hdl, void *args)
+{
+    uint32_t tx = 0, rx = 0, dur = 0;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_REQUEST,  &tx,  sizeof(tx));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY,    &rx,  sizeof(rx));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_DURATION, &dur, sizeof(dur));
+    ESP_LOGI(TAG, "DIAG-PING: FERTIG %u/%u empfangen (%ums)",
+             (unsigned)rx, (unsigned)tx, (unsigned)dur);
+    esp_ping_delete_session(hdl);
+}
+
+static esp_err_t diag_get(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char q[96] = {0}, ips[48] = "10.10.0.1", ifs[8] = "wg";
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        char v[48];
+        if (httpd_query_key_value(q, "ip", v, sizeof(v)) == ESP_OK) strlcpy(ips, v, sizeof(ips));
+        if (httpd_query_key_value(q, "if", v, sizeof(v)) == ESP_OK) strlcpy(ifs, v, sizeof(ifs));
+    }
+    ip_addr_t target;
+    if (ipaddr_aton(ips, &target) != 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ungueltige IP");
+        return ESP_FAIL;
+    }
+
+    // WG-netif-Beleg: da? Adresse? Index? (Quelle des Diag-Pings)
+    uint8_t wgidx = 0; char wgaddr[24] = "-";
+    if (s_wg_ctx.netif) {
+        wgidx = netif_get_index(s_wg_ctx.netif);
+        strlcpy(wgaddr, ip4addr_ntoa(netif_ip4_addr(s_wg_ctx.netif)), sizeof(wgaddr));
+    }
+    ESP_LOGI(TAG, "DIAG: Ziel=%s if=%s wg_netif=%s(idx %u) wg_up=%d default_set=%d nat=%d",
+             ips, ifs, wgaddr, wgidx, (int)s_wg_up, (int)s_wg_default_set, (int)s_nat_on);
+
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.target_addr = target;
+    cfg.count       = 4;
+    cfg.interval_ms = 500;
+    cfg.timeout_ms  = 1200;
+    if (strcmp(ifs, "wg") == 0 && s_wg_ctx.netif) cfg.interface = wgidx;  // an WG-netif binden
+
+    esp_ping_callbacks_t cbs = {
+        .on_ping_success = diag_ping_success,
+        .on_ping_timeout = diag_ping_timeout,
+        .on_ping_end     = diag_ping_end,
+        .cb_args         = NULL,
+    };
+    esp_ping_handle_t ping = NULL;
+    if (esp_ping_new_session(&cfg, &cbs, &ping) != ESP_OK || esp_ping_start(ping) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Ping-Session fehlgeschlagen");
+        return ESP_FAIL;
+    }
+    char msg[176];
+    snprintf(msg, sizeof(msg),
+             "DIAG-Ping -> %s (if=%s, wg=%s idx%u, wg_up=%d) gestartet. Ergebnis im CDC-Log.\n",
+             ips, ifs, wgaddr, wgidx, (int)s_wg_up);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, msg);
+}
+
+// Admin-Schalter "VPN-AUS": Tunnel komplett deaktivieren (trennen + kein
+// Reconnect) bzw. wieder aktivieren. POST /vpn?state=off|on (Feld im Body);
+// ohne Feld = umschalten. Persistent in NVS. Trennen/Starten macht der
+// Main-Task (HTTPD-Stack ist klein) -> hier nur Flag + Gate.
+static esp_err_t vpn_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[64] = {0};
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    if (len > 0) { int r = httpd_req_recv(req, body, len); if (r > 0) body[r] = 0; }
+    char v[8] = {0};
+    if (httpd_query_key_value(body, "state", v, sizeof(v)) == ESP_OK)
+        s_vpn_off = (strcmp(v, "off") == 0);   // "on" -> VPN an
+    else
+        s_vpn_off = !s_vpn_off;                // ohne Feld: umschalten
+    wg_creds_save();
+    update_internet_gate();                    // Kill-Switch ggf. sofort schliessen
+    ESP_LOGI(TAG, "VPN-Schalter (Admin): %s", s_vpn_off ? "AUS" : "AN");
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_sendstr(req, "");
+}
+
 static esp_err_t unlock_post(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
@@ -1047,6 +1170,7 @@ static void start_http(void)
         httpd_uri_t ota    = { .uri = "/ota",    .method = HTTP_POST, .handler = ota_post };
         httpd_uri_t wifi   = { .uri = "/wifi",   .method = HTTP_POST, .handler = wifi_post };
         httpd_uri_t scan   = { .uri = "/scan",   .method = HTTP_GET,  .handler = scan_get };
+        httpd_uri_t vpn    = { .uri = "/vpn",    .method = HTTP_POST, .handler = vpn_post };
         httpd_uri_t unlock = { .uri = "/unlock", .method = HTTP_POST, .handler = unlock_post };
         httpd_uri_t lock   = { .uri = "/lock",   .method = HTTP_POST, .handler = lock_post };
         httpd_uri_t wg     = { .uri = "/wg",      .method = HTTP_POST, .handler = wg_post };
@@ -1054,11 +1178,13 @@ static void start_http(void)
         httpd_uri_t rdp    = { .uri = "/rdp",     .method = HTTP_GET,  .handler = rdp_get };
         httpd_uri_t res    = { .uri = "/res",     .method = HTTP_POST, .handler = res_post };
         httpd_uri_t resdel = { .uri = "/resdel",  .method = HTTP_POST, .handler = resdel_post };
+        httpd_uri_t diag   = { .uri = "/diag",    .method = HTTP_GET,  .handler = diag_get };
         httpd_uri_t any    = { .uri = "/*",      .method = HTTP_GET,  .handler = captive_redirect };
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ota);
         httpd_register_uri_handler(server, &wifi);
         httpd_register_uri_handler(server, &scan);
+        httpd_register_uri_handler(server, &vpn);
         httpd_register_uri_handler(server, &unlock);
         httpd_register_uri_handler(server, &lock);
         httpd_register_uri_handler(server, &wg);
@@ -1066,6 +1192,7 @@ static void start_http(void)
         httpd_register_uri_handler(server, &rdp);
         httpd_register_uri_handler(server, &res);
         httpd_register_uri_handler(server, &resdel);
+        httpd_register_uri_handler(server, &diag);
         httpd_register_uri_handler(server, &any);   // muss ZULETZT registriert werden
         ESP_LOGI(TAG, "HTTP-Server auf 192.168.226.1 gestartet");
     } else {
@@ -1219,9 +1346,11 @@ void app_main(void)
     // Diagnose-Heartbeat: solange das hier laeuft, lebt das Geraet.
     for (int i = 0;; i++) {
         if (s_wg_reconnect) { s_wg_reconnect = false; wg_stop(); }  // Config-Wechsel
+        // Admin-Schalter "VPN-AUS": laufenden Tunnel trennen + Gate nachziehen.
+        if (s_vpn_off && s_wg_started) { wg_stop(); update_internet_gate(); }
         wg_poll();          // WireGuard-Peer-Status pruefen (+ LED)
-        // WLAN da, WG aber noch nicht gestartet (bzw. nach Reconnect)? -> starten.
-        if (s_wifi_connected && wg_configured() && !s_wg_started) wg_start();
+        // WLAN da, WG noch nicht gestartet, Schalter AN? -> starten.
+        if (s_wifi_connected && wg_configured() && !s_wg_started && !s_vpn_off) wg_start();
         ESP_LOGI(TAG, "alive #%d | rx=%u tx=%u | wlan=%s vpn=%s | heap=%u B",
                  i, (unsigned)s_rx_count, (unsigned)s_tx_count,
                  s_wifi_connected ? "up" : "down", s_wg_up ? "up" : "down",

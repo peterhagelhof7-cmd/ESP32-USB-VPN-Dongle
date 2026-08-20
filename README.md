@@ -21,17 +21,35 @@ Vollständige Konzeptbeschreibung: `ESP32-USB-VPN-Dongle.txt`.
 3. ✅ **DHCP + DNS + NAT** (USB ↔ WLAN): NAPT-Routing, DHCP nennt DNS-Server.
 4. ✅ **Captive Portal** („Netzwerk erfordert Anmeldung"): DNS-Hijack +
    302-Redirect solange gesperrt, Anmelde-/Sperr-Zustand koppelt das Internet.
-5. 🔧 **WireGuard**: droscy/esp_wireguard, Config über Webinterface + NVS,
-   Volltunnel-Schalter (ganzer PC-Verkehr durch VPN). *(HW-Verify offen.)*
-6. 🔧 **Kill-Switch + Firewall**: Kill-Switch (kein Internet ohne aktiven
-   VPN-Tunnel) + DNS-Quellfilter. LAN-Isolation (lwIP-Hook) folgt. *(HW-Verify offen.)*
-7. 🔧 **Admin-Login + sichere Konfig**: HTTP-Basic-Auth auf allen Steuer-/
+5. ✅ **WireGuard**: droscy/esp_wireguard, Config über Webinterface + NVS,
+   Volltunnel-Schalter (ganzer PC-Verkehr durch VPN), admin-geschützter
+   **VPN-AUS-Schalter**. Datenebene HW-verifiziert (PC→Dongle→Tunnel→Internet
+   0 % Verlust). *(Fix: `WIREGUARD_MAX_SRC_IPS` – siehe unten.)*
+6. ✅ **Kill-Switch + Firewall**: Kill-Switch (kein Internet ohne aktiven
+   VPN-Tunnel) + DNS-Quellfilter. *(Offen: echte LAN-Isolation via lwIP-Drop-Hook,
+   HTTP-UI nur aufs USB-Interface binden.)*
+7. ✅ **Admin-Login + sichere Konfig**: HTTP-Basic-Auth auf allen Steuer-/
    Konfig-Endpunkten, Passwort nur als SHA-256-Hash, Secrets nie im Web/Code.
-   *(HW-Verify offen; NVS-at-rest-Verschlüsselung = Deployment-Härtung.)*
-8. 🔧 **RDP-/Ressourcen-Manager**: interne Ziele (RDP/Link/SSH) im Webinterface
-   pflegen, dynamisch generierte `.rdp`-Datei pro Ziel herunterladen. *(HW-Verify offen.)*
+   *(Offen: NVS-at-rest-Verschlüsselung = Deployment-Härtung.)*
+8. ✅ **RDP-/Ressourcen-Manager**: interne Ziele (RDP/Link/SSH) im Webinterface
+   pflegen, dynamisch generierte `.rdp`-Datei pro Ziel herunterladen.
 9. ⬜ Automatischer Verbindungsaufbau (WLAN + WireGuard reconnecten bereits automatisch).
-10. ⬜ Performance/Stabilität.
+10. ⬜ Performance/Stabilität (Durchsatzmessung, Ziel 10 Mbit WLAN / 5 Mbit VPN).
+
+**Nächster Schritt:** DHCP **Option 121** (Classless Static Routes) – der Dongle
+gibt dem PC die VPN-Routen bzw. `0.0.0.0/0` per DHCP mit, damit der PC den Dongle
+ohne manuelle Host-Routen/Metriken bevorzugt (Plug-and-Play).
+
+### Diagnose / Bordmittel
+- `GET /diag?ip=<ziel>[&if=wg|any]` (Admin): ICMP-Ping **vom Gerät selbst** durch
+  den Tunnel, Ergebnis im CDC-Log – trennt Dongle- von Gegenstellen-Problemen.
+
+### Gotcha: `WIREGUARD_MAX_SRC_IPS`
+esp_wireguard setzt die Zahl der Allowed-IPs pro Peer ohne `CONFIG_WIREGUARD_MAX_SRC_IPS`
+auf **1**. Der einzige Slot ist schon von der eigenen Tunnel-IP (`/32`) belegt, sodass
+`add_allowed_ip(0.0.0.0/0)` keinen freien Slot findet → jeglicher Nutzdaten-Traffic
+läuft ins `ERR_RTE` (Handshake steht, Datenebene tot). Fix in `platformio.ini`:
+`-DCONFIG_WIREGUARD_MAX_SRC_IPS=8`.
 
 ### Status-LED (KY-016)
 rot = kein Uplink · blau = WLAN verbunden · grün = VPN-Tunnel aktiv.
