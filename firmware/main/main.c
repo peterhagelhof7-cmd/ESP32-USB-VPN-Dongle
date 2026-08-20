@@ -46,7 +46,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "opt121"
+#define FW_BUILD_TAG "rxfix"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -67,7 +67,7 @@ static int            s_wifi_retry;
 static bool           s_nat_on;
 // Captive-Portal-Zustand: gesperrt (Default) -> kein Internet, DNS-Hijack aufs
 // Dongle-Webinterface; entsperrt -> NAT an, DNS wird echt weitergeleitet.
-static volatile bool  s_unlocked;
+static volatile bool  s_unlocked = true;   // Default: Internet AN (spaeter per Einstellung anpassbar)
 // Kill-Switch (Phase 6): wenn scharf, gibt es Internet nur bei aktivem
 // VPN-Tunnel -> faellt WireGuard weg, wird die Weiterleitung sofort geblockt.
 static volatile bool  s_killswitch;
@@ -155,9 +155,13 @@ static esp_err_t usb_recv_cb(void *buffer, uint16_t len, void *ctx)
         void *copy = malloc(len);
         if (copy) {
             memcpy(copy, buffer, len);
-            if (esp_netif_receive(s_usb_netif, copy, len, NULL) != ESP_OK) {
-                free(copy);
-            }
+            // esp_netif_receive/ethernetif_input UEBERNIMMT 'copy' in ALLEN Faellen:
+            // bei Erfolg gibt der Netstack den PBUF_REF spaeter frei, in JEDEM
+            // Fehlerfall (netif down, pbuf-Alloc-Fehler, tcpip-Queue voll unter Last)
+            // sofort via esp_netif_free_rx_buffer -> driver_free_rx_buffer -> free().
+            // Also NIEMALS selbst freigeben -> sonst Double-Free (Heap-Korruption,
+            // Crash im TinyUSB-Task unter Last). Rueckgabewert bewusst ignoriert.
+            esp_netif_receive(s_usb_netif, copy, len, NULL);
         }
     }
 #endif
@@ -1414,6 +1418,7 @@ void app_main(void)
         // Admin-Schalter "VPN-AUS": laufenden Tunnel trennen + Gate nachziehen.
         if (s_vpn_off && s_wg_started) { wg_stop(); update_internet_gate(); }
         wg_poll();          // WireGuard-Peer-Status pruefen (+ LED)
+        update_internet_gate();  // idempotent: NAPT-Gate an Zustand angleichen (Default entsperrt)
         // WLAN da, WG noch nicht gestartet, Schalter AN? -> starten.
         if (s_wifi_connected && wg_configured() && !s_wg_started && !s_vpn_off) wg_start();
         ESP_LOGI(TAG, "alive #%d | rx=%u tx=%u | wlan=%s vpn=%s | heap=%u B",
