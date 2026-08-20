@@ -27,6 +27,10 @@
 #include "esp_wireguard.h"
 #include "mbedtls/md.h"
 #include "mbedtls/base64.h"
+#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS   // schaltet die mbedtls_aes_*-Deklarationen frei (IDF6/mbedtls4)
+#include "mbedtls/private/aes.h"   // aes.h nur unter private/ (Include-Pfad in CMakeLists)
+#include "esp_random.h"
+#include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
@@ -53,7 +57,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "ncm-only"
+#define FW_BUILD_TAG "config-mgmt"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -72,6 +76,8 @@ static volatile bool  s_wifi_connected;
 static esp_ip4_addr_t s_wifi_ip;
 static int            s_wifi_retry;
 static bool           s_nat_on;
+static volatile int64_t s_wifi_got_ip_us;  // Zeitpunkt GOT_IP (fuer Config-Poll 3 min danach)
+static bool           s_cfg_checked_once;   // Config-Server-Poll nach WLAN einmalig erledigt
 // Captive-Portal-Zustand: gesperrt (Default) -> kein Internet, DNS-Hijack aufs
 // Dongle-Webinterface; entsperrt -> NAT an, DNS wird echt weitergeleitet.
 static volatile bool  s_unlocked = true;   // Default: Internet AN (spaeter per Einstellung anpassbar)
@@ -421,6 +427,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_wifi_ip = ev->ip_info.ip;
         s_wifi_connected = true;
         s_wifi_retry = 0;
+        s_wifi_got_ip_us = esp_timer_get_time();   // Config-Poll 3 min danach
+        s_cfg_checked_once = false;
         led_update();       // blau: WLAN verbunden
         ESP_LOGI(TAG, "WLAN verbunden, IP " IPSTR, IP2STR(&ev->ip_info.ip));
         // WireGuard NICHT hier starten: esp_wireguard_init (DNS+Krypto+netif_add)
@@ -578,6 +586,270 @@ static bool require_auth(httpd_req_t *req)
     return false;
 }
 
+// === Systemname / Seriennummer / verschluesselte Konfig ======================
+// Seriennummer = kompakte Modul-MAC (efuse). Konfig-Datei = "BHVPN1." +
+// base64(IV(16) || AES-256-CBC-Ciphertext || HMAC-SHA256(32)), Schluessel aus
+// SHA256("bhvpn-enc:"+secret) bzw. "-mac:"; Encrypt-then-MAC (erkennt falsches
+// Secret). Identisches Format in tools/admin.ps1. Secret = 20 alphanumerisch.
+static char    s_systemname[40];
+static char    s_cfg_secret[24];    // Konfig-Verschluesselungs-Secret (20 Zeichen)
+static char    s_cfg_server[128];   // Config-Server-Basis-URL (plain http)
+static int32_t s_cfg_version;       // Version der zuletzt eingespielten Konfig
+static volatile bool s_cfg_update_available;
+static int32_t s_cfg_available_version;
+
+static void sn_string(char out[13])
+{
+    uint8_t m[6]; esp_efuse_mac_get_default(m);
+    snprintf(out, 13, "%02X%02X%02X%02X%02X%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+static void sys_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("sys", NVS_READONLY, &h) != ESP_OK) return;
+    size_t n;
+    n = sizeof(s_systemname); nvs_get_str(h, "name", s_systemname, &n);
+    n = sizeof(s_cfg_secret); nvs_get_str(h, "secret", s_cfg_secret, &n);
+    n = sizeof(s_cfg_server); nvs_get_str(h, "server", s_cfg_server, &n);
+    nvs_get_i32(h, "cfgver", &s_cfg_version);
+    nvs_close(h);
+}
+static void sys_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("sys", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, "name", s_systemname);
+    nvs_set_str(h, "secret", s_cfg_secret);
+    nvs_set_str(h, "server", s_cfg_server);
+    nvs_set_i32(h, "cfgver", s_cfg_version);
+    nvs_commit(h); nvs_close(h);
+}
+
+// SHA256(a || b) -> out[32]
+static void cfg_kdf(const char *a, const char *b, uint8_t out[32])
+{
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_context_t c; mbedtls_md_init(&c);
+    mbedtls_md_setup(&c, info, 0);
+    mbedtls_md_starts(&c);
+    mbedtls_md_update(&c, (const unsigned char *)a, strlen(a));
+    mbedtls_md_update(&c, (const unsigned char *)b, strlen(b));
+    mbedtls_md_finish(&c, out);
+    mbedtls_md_free(&c);
+}
+
+// SHA256(a[alen] || b[blen]) -> out[32]
+static void sha256_raw(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, uint8_t out[32])
+{
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_context_t c; mbedtls_md_init(&c);
+    mbedtls_md_setup(&c, info, 0);
+    mbedtls_md_starts(&c);
+    if (a && alen) mbedtls_md_update(&c, a, alen);
+    if (b && blen) mbedtls_md_update(&c, b, blen);
+    mbedtls_md_finish(&c, out);
+    mbedtls_md_free(&c);
+}
+// HMAC-SHA256 (32-Byte-Key) manuell -> unabhaengig von mbedtls_md_hmac.
+static void hmac_sha256(const uint8_t key[32], const uint8_t *msg, size_t mlen, uint8_t out[32])
+{
+    uint8_t ipad[64], opad[64], inner[32];
+    memset(ipad, 0, 64); memset(opad, 0, 64);
+    memcpy(ipad, key, 32); memcpy(opad, key, 32);
+    for (int i = 0; i < 64; i++) { ipad[i] ^= 0x36; opad[i] ^= 0x5c; }
+    sha256_raw(ipad, 64, msg, mlen, inner);
+    sha256_raw(opad, 64, inner, 32, out);
+}
+
+// Verschluesselt plain -> malloc'd "BHVPN1."+base64(...). NULL bei Fehler.
+static char *config_encrypt(const char *plain)
+{
+    if (!s_cfg_secret[0]) return NULL;
+    uint8_t encKey[32], macKey[32];
+    cfg_kdf("bhvpn-enc:", s_cfg_secret, encKey);
+    cfg_kdf("bhvpn-mac:", s_cfg_secret, macKey);
+    size_t plen = strlen(plain);
+    uint8_t pad = 16 - (plen % 16);            // PKCS7 (1..16)
+    size_t ctlen = plen + pad;
+    uint8_t *buf = malloc(16 + ctlen + 32);    // IV || CT || MAC
+    uint8_t *pt = malloc(ctlen);
+    if (!buf || !pt) { free(buf); free(pt); return NULL; }
+    esp_fill_random(buf, 16);
+    memcpy(pt, plain, plen);
+    memset(pt + plen, pad, pad);
+    mbedtls_aes_context aes; mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, encKey, 256);
+    uint8_t iv[16]; memcpy(iv, buf, 16);
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, ctlen, iv, pt, buf + 16);
+    mbedtls_aes_free(&aes);
+    free(pt);
+    hmac_sha256(macKey, buf, 16 + ctlen, buf + 16 + ctlen);
+    size_t blen = 16 + ctlen + 32, b64cap = ((blen + 2) / 3) * 4 + 1, olen = 0;
+    char *out = malloc(7 + b64cap + 1);
+    if (!out) { free(buf); return NULL; }
+    memcpy(out, "BHVPN1.", 7);
+    mbedtls_base64_encode((unsigned char *)out + 7, b64cap, &olen, buf, blen);
+    out[7 + olen] = 0;
+    free(buf);
+    return out;
+}
+
+// Entschluesselt "BHVPN1."-Datei -> malloc'd Klartext-JSON. NULL bei falschem
+// Secret / beschaedigt / falschem Format.
+static char *config_decrypt(const char *file)
+{
+    if (!s_cfg_secret[0]) return NULL;
+    while (*file == ' ' || *file == '\n' || *file == '\r' || *file == '\t') file++;
+    if (strncmp(file, "BHVPN1.", 7) != 0) return NULL;
+    const char *b64 = file + 7;
+    size_t b64len = strlen(b64);
+    while (b64len && (b64[b64len - 1] == '\n' || b64[b64len - 1] == '\r' ||
+                      b64[b64len - 1] == ' '  || b64[b64len - 1] == '\t')) b64len--;
+    size_t cap = (b64len / 4) * 3 + 4, blen = 0;
+    uint8_t *buf = malloc(cap);
+    if (!buf) return NULL;
+    if (mbedtls_base64_decode(buf, cap, &blen, (const unsigned char *)b64, b64len) != 0
+        || blen < 16 + 16 + 32 || ((blen - 48) % 16) != 0) { free(buf); return NULL; }
+    size_t ctlen = blen - 16 - 32;
+    uint8_t encKey[32], macKey[32], mac[32];
+    cfg_kdf("bhvpn-enc:", s_cfg_secret, encKey);
+    cfg_kdf("bhvpn-mac:", s_cfg_secret, macKey);
+    hmac_sha256(macKey, buf, 16 + ctlen, mac);
+    uint8_t diff = 0; for (int i = 0; i < 32; i++) diff |= mac[i] ^ buf[16 + ctlen + i];
+    if (diff) { free(buf); return NULL; }      // falsches Secret / manipuliert
+    uint8_t *pt = malloc(ctlen + 1);
+    if (!pt) { free(buf); return NULL; }
+    mbedtls_aes_context aes; mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, encKey, 256);
+    uint8_t iv[16]; memcpy(iv, buf, 16);
+    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, ctlen, iv, buf + 16, pt);
+    mbedtls_aes_free(&aes);
+    free(buf);
+    uint8_t pad = pt[ctlen - 1];
+    if (pad < 1 || pad > 16 || pad > ctlen) { free(pt); return NULL; }
+    pt[ctlen - pad] = 0;
+    return (char *)pt;
+}
+
+// Aktuelle Gesamtkonfig als key=value-Text (malloc'd). Feste Reihenfolge; Werte
+// enthalten kein '\n' (WG-Keys/base64 unkritisch, '=' im Wert erlaubt -> Split
+// am ERSTEN '='). Gleiches Format in tools/admin.ps1.
+static char *config_export_json(void)
+{
+    char sn[13]; sn_string(sn);
+    size_t cap = 4096, o = 0;
+    char *b = malloc(cap);
+    if (!b) return NULL;
+#define APP(...) do { o += snprintf(b + o, (o < cap ? cap - o : 0), __VA_ARGS__); } while (0)
+    APP("schema=1\n");
+    APP("version=%d\n", (int)s_cfg_version);
+    APP("systemname=%s\n", s_systemname);
+    APP("sn=%s\n", sn);
+    APP("wlan.ssid=%s\n", s_wifi_ssid);
+    APP("wlan.pass=%s\n", s_wifi_pass);
+    APP("wg.priv=%s\n", s_wg_priv);
+    APP("wg.pub=%s\n", s_wg_pub);
+    APP("wg.psk=%s\n", s_wg_psk);
+    APP("wg.endpoint=%s\n", s_wg_endpoint);
+    APP("wg.port=%d\n", s_wg_port);
+    APP("wg.addr=%s\n", s_wg_addr);
+    APP("wg.mask=%s\n", s_wg_netmask);
+    APP("wg.keepalive=%d\n", s_wg_keepalive);
+    APP("wg.fulltunnel=%d\n", s_wg_fulltunnel ? 1 : 0);
+    APP("wg.killswitch=%d\n", s_killswitch ? 1 : 0);
+    APP("wg.vpn_off=%d\n", s_vpn_off ? 1 : 0);
+    APP("admin.user=%s\n", s_admin_user);
+    APP("admin.phash=%s\n", s_admin_phash);
+    APP("res.count=%d\n", s_res_count);
+    for (int i = 0; i < s_res_count; i++) {
+        APP("res.%d.name=%s\n", i, s_res[i].name);
+        APP("res.%d.type=%s\n", i, s_res[i].type);
+        APP("res.%d.addr=%s\n", i, s_res[i].addr);
+        APP("res.%d.port=%d\n", i, s_res[i].port);
+    }
+#undef APP
+    if (o >= cap) { free(b); return NULL; }   // Ueberlauf
+    return b;
+}
+
+// key=value-Text einspielen (in-place tokenisiert): alle Zustaende + NVS.
+// Wird direkt vor einem Neustart aufgerufen. true bei Erfolg.
+static bool config_import_json(char *text)
+{
+    if (!text) return false;
+    memset(s_res, 0, sizeof(s_res));
+    char *line = text;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        size_t ll = strlen(line);
+        if (ll && line[ll - 1] == '\r') line[ll - 1] = 0;
+        char *eq = strchr(line, '=');
+        if (eq) {
+            *eq = 0;
+            const char *k = line, *v = eq + 1;
+            if      (!strcmp(k, "version"))       s_cfg_version = atoi(v);
+            else if (!strcmp(k, "systemname"))    strlcpy(s_systemname, v, sizeof(s_systemname));
+            else if (!strcmp(k, "wlan.ssid"))     strlcpy(s_wifi_ssid, v, sizeof(s_wifi_ssid));
+            else if (!strcmp(k, "wlan.pass"))     strlcpy(s_wifi_pass, v, sizeof(s_wifi_pass));
+            else if (!strcmp(k, "wg.priv"))       strlcpy(s_wg_priv, v, sizeof(s_wg_priv));
+            else if (!strcmp(k, "wg.pub"))        strlcpy(s_wg_pub, v, sizeof(s_wg_pub));
+            else if (!strcmp(k, "wg.psk"))        strlcpy(s_wg_psk, v, sizeof(s_wg_psk));
+            else if (!strcmp(k, "wg.endpoint"))   strlcpy(s_wg_endpoint, v, sizeof(s_wg_endpoint));
+            else if (!strcmp(k, "wg.port"))       s_wg_port = atoi(v);
+            else if (!strcmp(k, "wg.addr"))       strlcpy(s_wg_addr, v, sizeof(s_wg_addr));
+            else if (!strcmp(k, "wg.mask"))       strlcpy(s_wg_netmask, v, sizeof(s_wg_netmask));
+            else if (!strcmp(k, "wg.keepalive"))  s_wg_keepalive = atoi(v);
+            else if (!strcmp(k, "wg.fulltunnel")) s_wg_fulltunnel = atoi(v) != 0;
+            else if (!strcmp(k, "wg.killswitch")) s_killswitch = atoi(v) != 0;
+            else if (!strcmp(k, "wg.vpn_off"))    s_vpn_off = atoi(v) != 0;
+            else if (!strcmp(k, "admin.user"))    strlcpy(s_admin_user, v, sizeof(s_admin_user));
+            else if (!strcmp(k, "admin.phash"))   strlcpy(s_admin_phash, v, sizeof(s_admin_phash));
+            else if (!strncmp(k, "res.", 4)) {
+                int idx = atoi(k + 4);
+                const char *dot = strchr(k + 4, '.');
+                if (dot && idx >= 0 && idx < MAX_RES) {
+                    const char *f = dot + 1;
+                    resource_t *d = &s_res[idx];
+                    if      (!strcmp(f, "name")) strlcpy(d->name, v, sizeof(d->name));
+                    else if (!strcmp(f, "type")) strlcpy(d->type, v, sizeof(d->type));
+                    else if (!strcmp(f, "addr")) strlcpy(d->addr, v, sizeof(d->addr));
+                    else if (!strcmp(f, "port")) d->port = (uint16_t)atoi(v);
+                }
+            }
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    // Ressourcen kompaktieren (nur mit name+addr), Reihenfolge erhalten.
+    int n = 0;
+    for (int i = 0; i < MAX_RES; i++) {
+        if (s_res[i].name[0] && s_res[i].addr[0]) {
+            if (!s_res[i].type[0]) strcpy(s_res[i].type, "rdp");
+            if (n != i) { s_res[n] = s_res[i]; memset(&s_res[i], 0, sizeof(s_res[i])); }
+            n++;
+        }
+    }
+    s_res_count = n;
+
+    if (s_admin_phash[0]) {
+        char def[65]; sha256_hex("admin", def);
+        s_admin_is_default = (strcmp(s_admin_phash, def) == 0);
+    }
+
+    wifi_creds_save(s_wifi_ssid, s_wifi_pass);
+    wg_creds_save();
+    nvs_handle_t nh;
+    if (nvs_open("admin", NVS_READWRITE, &nh) == ESP_OK) {
+        nvs_set_str(nh, "user", s_admin_user);
+        nvs_set_str(nh, "phash", s_admin_phash);
+        nvs_commit(nh); nvs_close(nh);
+    }
+    res_save();
+    sys_save();
+    return true;
+}
+
 // --- HTTP-Testseite + OTA-Update --------------------------------------------
 // === Web-UI v2 ===============================================================
 // Oeffentliche Startseite "/" (ohne Login): WLAN komplett, VPN nur Status,
@@ -647,6 +919,26 @@ static const char UPLOAD_JS[] =
     "var x=new XMLHttpRequest();x.open('POST','/upload?name='+encodeURIComponent(f.name));"
     "x.onload=function(){ust.textContent=x.responseText;if(x.status==200)setTimeout(function(){location.reload();},800);};"
     "x.onerror=function(){ust.textContent='Fehler';};x.send(f);};</script>";
+
+static const char CONFIG_JS[] =
+    "<script>"
+    "cf.onsubmit=function(e){e.preventDefault();var f=cff.files[0];if(!f)return;"
+    "var x=new XMLHttpRequest();x.open('POST','/config/import');"
+    "x.onload=function(){cst.textContent=x.responseText;if(x.status==200)setTimeout(function(){location.href='/';},6000);};"
+    "x.onerror=function(){cst.textContent='Fehler';};x.send(f);};"
+    "function ccheck(){var s=document.getElementById('cchk');s.textContent='pruefe ...';"
+    "fetch('/config/check').then(function(r){return r.json();}).then(function(j){"
+    "var a=document.getElementById('capply');"
+    "if(j.result<0){s.textContent='keine Datei / Server nicht erreichbar / Secret falsch';a.innerHTML='';return;}"
+    "if(j.available){s.textContent='NEUE Konfig v'+j.server_version+' (aktuell v'+j.current_version+')';"
+    "a.innerHTML='<button type=button onclick=\"capply()\">Neue Konfig einspielen</button>';}"
+    "else{s.textContent='keine neue (Server v'+j.server_version+', aktuell v'+j.current_version+')';a.innerHTML='';}"
+    "}).catch(function(){s.textContent='Fehler';});}"
+    "function capply(){if(!confirm('Server-Konfig einspielen? Geraet startet neu.'))return;"
+    "var x=new XMLHttpRequest();x.open('POST','/config/apply');"
+    "x.onload=function(){document.getElementById('capply').textContent=x.responseText;"
+    "if(x.status==200)setTimeout(function(){location.href='/';},6000);};x.send();}"
+    "</script>";
 
 static const char OTA_JS[] =
     "<script>f.onsubmit=function(e){e.preventDefault();var file=fw.files[0];if(!file)return;"
@@ -827,6 +1119,30 @@ static esp_err_t settings_get(httpd_req_t *req)
     send_status(req);
     httpd_resp_sendstr_chunk(req, "</div>");
 
+    // System: Name + Seriennummer (MAC) + Konfig-Secret + Config-Server.
+    { char sn[13]; sn_string(sn);
+      SENDF(req, "<div class=card><h2>System</h2>"
+        "<div class=v>Seriennummer (SN): <b>%s</b></div>"
+        "<form method=post action=/sys style='font-size:13px'>"
+        "<input name=name placeholder=Systemname value='%s' style='width:90%%;margin:2px'><br>"
+        "<input name=secret type=password placeholder='Konfig-Secret (20 alphanum., leer=unveraendert)' style='width:90%%;margin:2px'><br>"
+        "<input name=server placeholder='Config-Server-URL http://...' value='%s' style='width:90%%;margin:2px'><br>"
+        "<button type=submit>Speichern</button></form></div>",
+        sn, s_systemname, s_cfg_server); }
+
+    // Konfiguration: verschluesselter Export/Import + Config-Server-Abfrage.
+    SENDF(req, "<div class=card><h2>Konfiguration</h2>"
+        "<div class=v>Konfig-Secret: <b>%s</b></div>"
+        "<div class=v style='margin-top:4px'><a href='/config/export'>&#11015; Konfig herunterladen (verschluesselt)</a></div>"
+        "<form id=cf style='margin-top:6px;font-size:13px'><input type=file id=cff accept='.bhvpn' required> "
+        "<button type=submit>Konfig hochladen + einspielen</button></form><div id=cst class=v></div>"
+        "<div style='border-top:1px solid #33406a;margin-top:8px;padding-top:6px'>"
+        "<div class=v>Config-Server: %s</div>"
+        "<button type=button onclick='ccheck()' style='margin-top:4px'>Beim Server pruefen</button> "
+        "<span id=cchk class=v></span><div id=capply style='margin-top:6px'></div></div></div>",
+        s_cfg_secret[0] ? "gesetzt" : "NICHT gesetzt (fuer Up-/Download noetig)",
+        s_cfg_server[0] ? s_cfg_server : "(keiner)");
+
     // Internet-Zugang (Captive).
     SENDF(req, "<div class=card><h2>Internet-Zugang</h2>"
         "<div class=v>Status: <b style='color:%s'>%s</b></div>%s</div>",
@@ -898,6 +1214,7 @@ static esp_err_t settings_get(httpd_req_t *req)
         "<button type=submit>Update einspielen</button></form>"
         "<progress id=p max=100 value=0 hidden></progress><div id=st class=v></div></div>",
         app ? app->version : "?", FW_BUILD_TAG, esp_ota_get_running_partition()->label);
+    httpd_resp_sendstr_chunk(req, CONFIG_JS);
     httpd_resp_sendstr_chunk(req, OTA_JS);
     httpd_resp_sendstr_chunk(req, "</body></html>");
     httpd_resp_sendstr_chunk(req, NULL);
@@ -1179,6 +1496,164 @@ static esp_err_t delfile_post(httpd_req_t *req)
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_sendstr(req, "");
+}
+
+// --- Config-Server (plain http, verschluesselte Datei je Seriennummer) ------
+// GET <url>/<SN>/config.json -> malloc'd Body (NUL-terminiert) oder NULL.
+static char *http_get_all(const char *url)
+{
+    esp_http_client_config_t cfg = { .url = url, .timeout_ms = 8000, .method = HTTP_METHOD_GET };
+    esp_http_client_handle_t cl = esp_http_client_init(&cfg);
+    if (!cl) return NULL;
+    char *body = NULL;
+    if (esp_http_client_open(cl, 0) == ESP_OK) {
+        int clen = esp_http_client_fetch_headers(cl);
+        if (esp_http_client_get_status_code(cl) == 200) {
+            size_t cap = (clen > 0 && clen < 16384) ? (size_t)clen + 1 : 8192;
+            body = malloc(cap);
+            if (body) {
+                int total = 0, r;
+                while ((size_t)total < cap - 1 &&
+                       (r = esp_http_client_read(cl, body + total, cap - 1 - total)) > 0) total += r;
+                body[total] = 0;
+            }
+        }
+        esp_http_client_close(cl);
+    }
+    esp_http_client_cleanup(cl);
+    return body;
+}
+static void config_server_url(char *out, size_t n)
+{
+    char sn[13]; sn_string(sn);
+    size_t l = strlen(s_cfg_server);
+    while (l > 0 && s_cfg_server[l - 1] == '/') l--;
+    snprintf(out, n, "%.*s/%s/config.json", (int)l, s_cfg_server, sn);
+}
+// -1 = Fehler/keine, 0 = keine neue, 1 = neue Version vorhanden.
+static int config_server_check(void)
+{
+    s_cfg_update_available = false;
+    if (!s_cfg_server[0] || !s_cfg_secret[0]) return -1;
+    char url[208]; config_server_url(url, sizeof(url));
+    char *ft = http_get_all(url);
+    if (!ft) return -1;
+    char *pt = config_decrypt(ft); free(ft);
+    if (!pt) return -1;
+    int ver = -1;
+    for (char *p = pt; p; ) {
+        if (!strncmp(p, "version=", 8)) { ver = atoi(p + 8); break; }
+        char *nl = strchr(p, '\n');
+        p = nl ? nl + 1 : NULL;
+    }
+    free(pt);
+    if (ver < 0) return -1;
+    s_cfg_available_version = ver;
+    if (ver > s_cfg_version) { s_cfg_update_available = true; return 1; }
+    return 0;
+}
+
+// GET /config/export (Admin) -> verschluesselte Konfig als Download.
+static esp_err_t config_export_get(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    if (!s_cfg_secret[0]) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "kein Konfig-Secret gesetzt"); return ESP_FAIL; }
+    char *json = config_export_json();
+    char *enc = json ? config_encrypt(json) : NULL;
+    free(json);
+    if (!enc) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "export"); return ESP_FAIL; }
+    char sn[13]; sn_string(sn);
+    char disp[112];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"%s-%s.bhvpn\"",
+             s_systemname[0] ? s_systemname : "dongle", sn);
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+    httpd_resp_sendstr(req, enc);
+    free(enc);
+    return ESP_OK;
+}
+// POST /config/import (Admin): Datei -> entschluesseln + einspielen + Neustart.
+static esp_err_t config_import_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    int len = req->content_len;
+    if (len <= 0 || len > 16384) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Groesse"); return ESP_FAIL; }
+    char *body = malloc(len + 1);
+    if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "RAM"); return ESP_FAIL; }
+    int total = 0, r;
+    while (total < len && (r = httpd_req_recv(req, body + total, len - total)) > 0) total += r;
+    body[total] = 0;
+    char *pt = config_decrypt(body); free(body);
+    if (!pt) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "falsches Secret oder ungueltige Datei"); return ESP_FAIL; }
+    bool ok = config_import_json(pt); free(pt);
+    if (!ok) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ungueltige Konfig"); return ESP_FAIL; }
+    httpd_resp_sendstr(req, "Konfig eingespielt - Geraet startet neu ...");
+    vTaskDelay(pdMS_TO_TICKS(600));
+    esp_restart();
+    return ESP_OK;
+}
+// POST /sys (Admin): Systemname / Config-Secret / Config-Server-URL.
+static esp_err_t sys_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[512];
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    int r = httpd_req_recv(req, body, len);
+    if (r <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "kein Body"); return ESP_FAIL; }
+    body[r] = 0;
+    char enc[160], dec[160];
+#define SYS_GETF(k, dst) do { if (httpd_query_key_value(body, k, enc, sizeof(enc)) == ESP_OK) { \
+        url_decode(dec, enc, sizeof(dec)); strlcpy(dst, dec, sizeof(dst)); } } while (0)
+    SYS_GETF("name", s_systemname);
+    SYS_GETF("server", s_cfg_server);
+    // Secret: nur bei Eingabe ueberschreiben; nur alphanumerisch, max 20 Zeichen.
+    if (httpd_query_key_value(body, "secret", enc, sizeof(enc)) == ESP_OK) {
+        url_decode(dec, enc, sizeof(dec));
+        if (dec[0]) {
+            char clean[24]; size_t o = 0;
+            for (size_t i = 0; dec[i] && o < 20; i++) {
+                char c = dec[i];
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) clean[o++] = c;
+            }
+            clean[o] = 0;
+            strlcpy(s_cfg_secret, clean, sizeof(s_cfg_secret));
+        }
+    }
+#undef SYS_GETF
+    sys_save();
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_sendstr(req, "");
+}
+// GET /config/check (Admin): jetzt beim Config-Server nachsehen -> JSON-Status.
+static esp_err_t config_check_get(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    int res = config_server_check();
+    char out[160];
+    snprintf(out, sizeof(out),
+             "{\"result\":%d,\"available\":%s,\"server_version\":%d,\"current_version\":%d}",
+             res, s_cfg_update_available ? "true" : "false",
+             (int)s_cfg_available_version, (int)s_cfg_version);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, out);
+}
+// POST /config/apply (Admin): Konfig vom Server holen + einspielen + Neustart.
+static esp_err_t config_apply_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    if (!s_cfg_server[0] || !s_cfg_secret[0]) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Server/Secret fehlt"); return ESP_FAIL; }
+    char url[208]; config_server_url(url, sizeof(url));
+    char *ft = http_get_all(url);
+    if (!ft) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Server nicht erreichbar / keine Datei"); return ESP_FAIL; }
+    char *pt = config_decrypt(ft); free(ft);
+    if (!pt) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "falsches Secret / ungueltig"); return ESP_FAIL; }
+    bool ok = config_import_json(pt); free(pt);
+    if (!ok) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ungueltige Konfig"); return ESP_FAIL; }
+    httpd_resp_sendstr(req, "Server-Konfig eingespielt - Neustart ...");
+    vTaskDelay(pdMS_TO_TICKS(600));
+    esp_restart();
+    return ESP_OK;
 }
 
 // Verfuegbare WLANs scannen -> JSON [{ssid,rssi,lock}]. Blockierender Scan (~3 s).
@@ -1503,7 +1978,7 @@ static void start_http(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
     cfg.stack_size = 12288;  // OTA + chunked Rendering (SENDF-Puffer) brauchen Stack
-    cfg.max_uri_handlers = 24;
+    cfg.max_uri_handlers = 32;
     cfg.uri_match_fn = httpd_uri_match_wildcard;   // fuer Catch-all "/*"
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &cfg) == ESP_OK) {
@@ -1525,6 +2000,11 @@ static void start_http(void)
         httpd_uri_t upl    = { .uri = "/upload",  .method = HTTP_POST, .handler = upload_post };
         httpd_uri_t dl     = { .uri = "/dl",      .method = HTTP_GET,  .handler = dl_get };
         httpd_uri_t delf   = { .uri = "/delfile", .method = HTTP_POST, .handler = delfile_post };
+        httpd_uri_t sys    = { .uri = "/sys",     .method = HTTP_POST, .handler = sys_post };
+        httpd_uri_t cexp   = { .uri = "/config/export", .method = HTTP_GET,  .handler = config_export_get };
+        httpd_uri_t cimp   = { .uri = "/config/import", .method = HTTP_POST, .handler = config_import_post };
+        httpd_uri_t cchk   = { .uri = "/config/check",  .method = HTTP_GET,  .handler = config_check_get };
+        httpd_uri_t capl   = { .uri = "/config/apply",  .method = HTTP_POST, .handler = config_apply_post };
         httpd_uri_t any    = { .uri = "/*",      .method = HTTP_GET,  .handler = captive_redirect };
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ota);
@@ -1544,6 +2024,11 @@ static void start_http(void)
         httpd_register_uri_handler(server, &upl);
         httpd_register_uri_handler(server, &dl);
         httpd_register_uri_handler(server, &delf);
+        httpd_register_uri_handler(server, &sys);
+        httpd_register_uri_handler(server, &cexp);
+        httpd_register_uri_handler(server, &cimp);
+        httpd_register_uri_handler(server, &cchk);
+        httpd_register_uri_handler(server, &capl);
         httpd_register_uri_handler(server, &any);   // muss ZULETZT registriert werden
         ESP_LOGI(TAG, "HTTP-Server auf 192.168.226.1 gestartet");
     } else {
@@ -1691,6 +2176,7 @@ void app_main(void)
     wg_creds_load();      // Phase 5: WireGuard-Config aus NVS (vor WLAN-GOT_IP)
     admin_load();          // Phase 7: Admin-Zugang aus NVS (Default admin/admin)
     res_load();            // Phase 8: interne Ressourcen aus NVS
+    sys_load();            // Systemname / Config-Secret / Config-Server aus NVS
     storage_init();        // SPIFFS 'storage' fuer Datei-Upload/Download mounten
     start_usb_netif();    // dann Subnetz + DHCP (nicht-fatal)
     start_wifi();          // Phase 2: WLAN-Uplink (STA)
@@ -1710,6 +2196,14 @@ void app_main(void)
         if (s_vpn_off && s_wg_started) { wg_stop(); update_internet_gate(); }
         wg_poll();          // WireGuard-Peer-Status pruefen (+ LED)
         update_internet_gate();  // idempotent: NAPT-Gate an Zustand angleichen (Default entsperrt)
+        // Config-Server: EINMALIG 3 min nach WLAN-Connect nachsehen (sonst manuell).
+        if (s_wifi_connected && !s_cfg_checked_once && s_cfg_server[0] && s_cfg_secret[0]
+            && s_wifi_got_ip_us && (esp_timer_get_time() - s_wifi_got_ip_us) > 180000000LL) {
+            s_cfg_checked_once = true;
+            int rc = config_server_check();
+            ESP_LOGI(TAG, "Config-Server-Poll: rc=%d neue=%d (Server v%d / aktuell v%d)",
+                     rc, (int)s_cfg_update_available, (int)s_cfg_available_version, (int)s_cfg_version);
+        }
         // WLAN da, WG noch nicht gestartet, Schalter AN? -> starten.
         if (s_wifi_connected && wg_configured() && !s_wg_started && !s_vpn_off) wg_start();
         ESP_LOGI(TAG, "alive #%d | rx=%u tx=%u | wlan=%s vpn=%s | heap=%u B",
