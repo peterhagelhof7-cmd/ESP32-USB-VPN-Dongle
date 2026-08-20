@@ -18,6 +18,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_netif.h"
+#include "esp_netif_net_stack.h"
 #include "esp_wifi.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
@@ -45,7 +46,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "wg-fixed"
+#define FW_BUILD_TAG "opt121"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -184,6 +185,70 @@ static volatile bool s_vpn_off;        // Admin-Schalter "VPN-AUS": Tunnel deakt
 static bool wg_configured(void)
 {
     return s_wg_priv[0] && s_wg_pub[0] && s_wg_endpoint[0] && s_wg_addr[0];
+}
+
+// --- DHCP Option 121 (Classless Static Routes, RFC 3442) --------------------
+// Der DHCP-Server des Dongles gibt dem PC gezielt Routen mit, damit er den
+// Dongle OHNE manuelle Host-Routen/Metriken bevorzugt: Volltunnel -> 0.0.0.0/0,
+// sonst (Split) das WG-Remote-Subnetz. Aufgerufen aus dem lwIP-DHCPS-Hook
+// (dongle_lwip_hooks.h, via ESP_IDF_LWIP_HOOK_FILENAME). PC muss danach einen
+// DHCP-Renew machen (Neu-Einstecken / ipconfig /renew), um die Routen zu ziehen.
+static struct netif *s_usb_lwip_netif;
+
+static uint8_t dongle_mask_to_prefix(uint32_t mask_be)
+{
+    uint32_t m = lwip_ntohl(mask_be);
+    uint8_t n = 0;
+    while (m & 0x80000000UL) { n++; m <<= 1; }
+    return n;
+}
+
+void dongle_dhcps_append_opts(struct netif *netif, unsigned char state, unsigned char **pp_opts)
+{
+    // Nur echte Leases (DHCPOFFER=2 / DHCPACK=5), nicht NAK.
+    if (state != 2 && state != 5) return;
+    // Nur auf dem USB-Interface (DHCP-Server laeuft ohnehin nur dort).
+    if (!s_usb_lwip_netif && s_usb_netif) s_usb_lwip_netif = esp_netif_get_netif_impl(s_usb_netif);
+    if (s_usb_lwip_netif && netif != s_usb_lwip_netif) return;
+
+    // Routenliste bestimmen (dest_be im Network-Byte-Order + Praefix).
+    struct { uint32_t dest_be; uint8_t prefix; } routes[2];
+    int nroutes = 0;
+    if (s_wg_fulltunnel) {
+        // Volltunnel: 0.0.0.0/1 + 128.0.0.0/1 statt 0.0.0.0/0 -> spezifischer als
+        // jede Default-Route, gewinnt also OHNE Metrik-Gefummel gegen das WLAN.
+        routes[0].dest_be = 0;                 routes[0].prefix = 1;   // 0.0.0.0/1
+        routes[1].dest_be = lwip_htonl(0x80000000UL); routes[1].prefix = 1; // 128.0.0.0/1
+        nroutes = 2;
+    } else if (wg_configured()) {
+        // Split: nur das WG-Remote-Subnetz ueber den Dongle (spezifisch -> gewinnt).
+        esp_ip4_addr_t a = {0}, m = {0};
+        if (esp_netif_str_to_ip4(s_wg_addr, &a) == ESP_OK &&
+            esp_netif_str_to_ip4(s_wg_netmask[0] ? s_wg_netmask : "255.255.255.0", &m) == ESP_OK) {
+            routes[0].dest_be = a.addr & m.addr;
+            routes[0].prefix  = dongle_mask_to_prefix(m.addr);
+            nroutes = 1;
+        }
+    }
+    if (nroutes == 0) return;
+
+    // Gateway = eigene USB-IP (192.168.226.1), aus dem netif.
+    uint32_t gw_be = netif_ip4_addr(netif)->addr;
+
+    // Gesamtlaenge vorab bestimmen (pro Route: 1 Praefix + Oktette + 4 GW).
+    uint8_t total = 0;
+    for (int r = 0; r < nroutes; r++) total += 1 + (routes[r].prefix + 7) / 8 + 4;
+
+    uint8_t *p = *pp_opts;
+    *p++ = 121;                                  // CLASSLESS_ROUTE
+    *p++ = total;
+    for (int r = 0; r < nroutes; r++) {
+        uint8_t destlen = (routes[r].prefix + 7) / 8;    // signifikante Oktette
+        *p++ = routes[r].prefix;
+        for (uint8_t i = 0; i < destlen; i++) *p++ = (uint8_t)(routes[r].dest_be >> (8 * i)) & 0xFF; // MSB zuerst
+        for (uint8_t i = 0; i < 4; i++)       *p++ = (uint8_t)(gw_be >> (8 * i)) & 0xFF;
+    }
+    *pp_opts = p;
 }
 
 // LED-Zustand: gruen=VPN, blau=WLAN, rot=nichts.

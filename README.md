@@ -33,12 +33,17 @@ Vollständige Konzeptbeschreibung: `ESP32-USB-VPN-Dongle.txt`.
    *(Offen: NVS-at-rest-Verschlüsselung = Deployment-Härtung.)*
 8. ✅ **RDP-/Ressourcen-Manager**: interne Ziele (RDP/Link/SSH) im Webinterface
    pflegen, dynamisch generierte `.rdp`-Datei pro Ziel herunterladen.
-9. ⬜ Automatischer Verbindungsaufbau (WLAN + WireGuard reconnecten bereits automatisch).
+9. ✅ **Plug-and-Play-Routing (DHCP Option 121)**: der DHCP-Server des Dongles
+   gibt dem PC via Classless Static Routes (RFC 3442) selbst die Routen mit –
+   Volltunnel als `0.0.0.0/1`+`128.0.0.0/1` (spezifischer als jede Default-Route,
+   gewinnt ohne Metrik-Gefummel), Split als WG-Remote-Subnetz. Kein manuelles
+   `route add` mehr nötig; PC braucht nur einen DHCP-Renew (Neu-Einstecken).
+   *(HW-verifiziert: PC routet automatisch durch den Tunnel, 0 % Verlust.)*
 10. ⬜ Performance/Stabilität (Durchsatzmessung, Ziel 10 Mbit WLAN / 5 Mbit VPN).
 
-**Nächster Schritt:** DHCP **Option 121** (Classless Static Routes) – der Dongle
-gibt dem PC die VPN-Routen bzw. `0.0.0.0/0` per DHCP mit, damit der PC den Dongle
-ohne manuelle Host-Routen/Metriken bevorzugt (Plug-and-Play).
+**Offen:** echter Split-Tunnel-Datenpfad (Option 121 pusht das WG-Subnetz bereits,
+aber die Firmware muss es im Split-Modus noch als `allowed_ip` eintragen);
+LAN-Isolation; NVS-Verschlüsselung; macOS; Durchsatzmessung.
 
 ### Diagnose / Bordmittel
 - `GET /diag?ip=<ziel>[&if=wg|any]` (Admin): ICMP-Ping **vom Gerät selbst** durch

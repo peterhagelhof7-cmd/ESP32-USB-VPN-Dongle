@@ -9,3 +9,9 @@ idf_component_register(
     PRIV_REQUIRES esp_netif esp_wifi esp_http_server nvs_flash esp_event driver
                   app_update esp_app_format esp_partition espcoredump lwip mbedtls
 )
+
+# Benutzerdefinierter lwIP-Hook (DHCP-Server Option 121). esp-idfs
+# lwip_default_hooks.h includet ESP_IDF_LWIP_HOOK_FILENAME -> unser Header.
+# Global setzen, damit die lwip-Komponente (dhcpserver.c) den Header sieht.
+idf_build_set_property(COMPILE_DEFINITIONS "ESP_IDF_LWIP_HOOK_FILENAME=\"dongle_lwip_hooks.h\"" APPEND)
+idf_build_set_property(COMPILE_OPTIONS "-I${CMAKE_CURRENT_LIST_DIR}" APPEND)
