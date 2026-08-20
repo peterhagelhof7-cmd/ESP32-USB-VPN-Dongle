@@ -57,7 +57,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "config-mgmt"
+#define FW_BUILD_TAG "multiwlan-fix"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -70,8 +70,16 @@ static esp_netif_t *s_usb_netif;
 
 // --- WLAN-Uplink (STA) Zustand ---
 static esp_netif_t   *s_sta_netif;
-static char           s_wifi_ssid[33];
+static char           s_wifi_ssid[33];   // aktuell angesteuerte SSID
 static char           s_wifi_pass[64];
+// Mehrere bekannte WLANs, Reihenfolge = Prioritaet (0 = hoechste). Der Manager
+// verbindet mit dem hoechstprioren VERFUEGBAREN und wechselt bei Bedarf.
+#define MAX_WLAN 5
+typedef struct { char ssid[33]; char pass[64]; } wlan_t;
+static wlan_t         s_wlans[MAX_WLAN];
+static int            s_wlan_count;
+static int            s_wlan_current = -1;    // Index der aktiven Verbindung
+static int64_t        s_wlan_last_scan_us;    // letzter Manager-Scan
 static volatile bool  s_wifi_connected;
 static esp_ip4_addr_t s_wifi_ip;
 static int            s_wifi_retry;
@@ -385,27 +393,113 @@ static void wg_poll(void)
     }
 }
 
-// --- WLAN-Uplink (STA-Client) -----------------------------------------------
-static void wifi_creds_load(void)
+// --- WLAN-Uplink (STA-Client), mehrere bekannte WLANs -----------------------
+static void wlan_list_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, "list", s_wlans, sizeof(s_wlans));
+    nvs_set_i32(h, "cnt", s_wlan_count);
+    nvs_commit(h); nvs_close(h);
+}
+static void wlan_list_load(void)
 {
     nvs_handle_t h;
     if (nvs_open("wifi", NVS_READONLY, &h) != ESP_OK) return;
-    size_t sl = sizeof(s_wifi_ssid), pl = sizeof(s_wifi_pass);
-    nvs_get_str(h, "ssid", s_wifi_ssid, &sl);
-    nvs_get_str(h, "pass", s_wifi_pass, &pl);
+    int32_t c = 0; size_t sz = sizeof(s_wlans);
+    if (nvs_get_blob(h, "list", s_wlans, &sz) == ESP_OK && nvs_get_i32(h, "cnt", &c) == ESP_OK) {
+        s_wlan_count = (c >= 0 && c <= MAX_WLAN) ? c : 0;
+    } else {
+        // Migration: frueheres einzelnes ssid/pass -> Liste[0].
+        char ssid[33] = {0}, pass[64] = {0};
+        size_t sl = sizeof(ssid), pl = sizeof(pass);
+        if (nvs_get_str(h, "ssid", ssid, &sl) == ESP_OK && ssid[0]) {
+            nvs_get_str(h, "pass", pass, &pl);
+            strlcpy(s_wlans[0].ssid, ssid, sizeof(s_wlans[0].ssid));
+            strlcpy(s_wlans[0].pass, pass, sizeof(s_wlans[0].pass));
+            s_wlan_count = 1;
+        }
+    }
     nvs_close(h);
 }
-
-static esp_err_t wifi_creds_save(const char *ssid, const char *pass)
+// Hinzufuegen/aktualisieren. Vorhandene SSID -> nur Passwort updaten. -> Index.
+static int wlan_add(const char *ssid, const char *pass)
 {
-    nvs_handle_t h;
-    esp_err_t e = nvs_open("wifi", NVS_READWRITE, &h);
-    if (e != ESP_OK) return e;
-    nvs_set_str(h, "ssid", ssid);
-    nvs_set_str(h, "pass", pass);
-    e = nvs_commit(h);
-    nvs_close(h);
-    return e;
+    if (!ssid || !ssid[0]) return -1;
+    for (int i = 0; i < s_wlan_count; i++)
+        if (strcmp(s_wlans[i].ssid, ssid) == 0) { strlcpy(s_wlans[i].pass, pass, sizeof(s_wlans[i].pass)); return i; }
+    if (s_wlan_count >= MAX_WLAN) return -1;
+    memset(&s_wlans[s_wlan_count], 0, sizeof(wlan_t));
+    strlcpy(s_wlans[s_wlan_count].ssid, ssid, sizeof(s_wlans[s_wlan_count].ssid));
+    strlcpy(s_wlans[s_wlan_count].pass, pass ? pass : "", sizeof(s_wlans[s_wlan_count].pass));
+    return s_wlan_count++;
+}
+// Blockierender Scan -> Index des hoechstprioren (kleinster Index) verfuegbaren
+// gespeicherten WLANs, oder -1.
+static int wlan_scan_best(void)
+{
+    if (s_wlan_count == 0) return -1;
+    wifi_scan_config_t sc = { .show_hidden = false };
+    if (esp_wifi_scan_start(&sc, true) != ESP_OK) return -1;
+    uint16_t n = 0; esp_wifi_scan_get_ap_num(&n);
+    if (n == 0) return -1;
+    if (n > 30) n = 30;
+    wifi_ap_record_t *recs = calloc(n, sizeof(wifi_ap_record_t));
+    if (!recs) return -1;
+    esp_wifi_scan_get_ap_records(&n, recs);
+    int best = -1;
+    for (int w = 0; w < s_wlan_count && best < 0; w++)
+        for (int a = 0; a < n; a++)
+            if (strcmp((char *)recs[a].ssid, s_wlans[w].ssid) == 0) { best = w; break; }
+    free(recs);
+    return best;
+}
+// Auf gespeichertes WLAN i verbinden.
+static void wlan_connect_to(int i)
+{
+    if (i < 0 || i >= s_wlan_count) return;
+    strlcpy(s_wifi_ssid, s_wlans[i].ssid, sizeof(s_wifi_ssid));
+    strlcpy(s_wifi_pass, s_wlans[i].pass, sizeof(s_wifi_pass));
+    s_wlan_current = i;
+    wifi_config_t wc = { 0 };
+    memcpy(wc.sta.ssid, s_wifi_ssid, sizeof(wc.sta.ssid));
+    memcpy(wc.sta.password, s_wifi_pass, sizeof(wc.sta.password));
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    s_wifi_retry = 0;
+    esp_wifi_disconnect();
+    esp_wifi_connect();
+}
+// Vom Main-Task aufgerufen: bei Ausfall auf ein anderes verfuegbares WLAN
+// wechseln; im Verbundzustand periodisch auf ein hoeher priorisiertes wechseln
+// (Szenario: temporaerer Hotspot -> Rueckkehr an den Arbeitsplatz).
+static void wlan_manager(void)
+{
+    if (s_wlan_count == 0) return;
+    int64_t now = esp_timer_get_time();
+    if (!s_wifi_connected) {
+        // Recovery per ROUND-ROBIN (KEIN Scan): esp_wifi_scan_start scheitert,
+        // solange ein Verbindungsversuch laeuft. Nach mehreren Fehlversuchen das
+        // naechste gespeicherte WLAN anvisieren -> jedes verfuegbare wird
+        // gefunden, und ein "verwaistes" Ziel (geloeschtes WLAN) wird korrigiert.
+        if (s_wifi_retry >= 5 && (now - s_wlan_last_scan_us) > 6000000LL) {
+            s_wlan_last_scan_us = now;
+            int next = s_wlan_current + 1;
+            if (next >= s_wlan_count || next < 0) next = 0;
+            ESP_LOGI(TAG, "WLAN-Recovery: probiere '%s' (Prio %d)", s_wlans[next].ssid, next);
+            wlan_connect_to(next);
+        }
+    } else if (s_wlan_count > 1 && s_wlan_current > 0) {
+        // Verbunden mit nicht-hoechster Prio: alle 60 s pruefen, ob ein hoeher
+        // priorisiertes WLAN verfuegbar ist (Scan im Verbundzustand ist ok).
+        if ((now - s_wlan_last_scan_us) > 60000000LL) {
+            s_wlan_last_scan_us = now;
+            int best = wlan_scan_best();
+            if (best >= 0 && best < s_wlan_current) {
+                ESP_LOGI(TAG, "WLAN-Switch (hoehere Prio verfuegbar) -> '%s'", s_wlans[best].ssid);
+                wlan_connect_to(best);
+            }
+        }
+    }
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -437,21 +531,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     }
 }
 
-// Zugangsdaten uebernehmen (aus Webinterface): speichern + neu verbinden.
+// Zugangsdaten aus Webinterface: in die Liste aufnehmen (Prioritaet = Reihen-
+// folge) + sofort verbinden. Vorhandene SSID -> Passwort aktualisieren.
 static void wifi_apply(const char *ssid, const char *pass)
 {
-    snprintf(s_wifi_ssid, sizeof(s_wifi_ssid), "%s", ssid);
-    snprintf(s_wifi_pass, sizeof(s_wifi_pass), "%s", pass);
-    wifi_creds_save(s_wifi_ssid, s_wifi_pass);
-
-    wifi_config_t wc = { 0 };
-    memcpy(wc.sta.ssid, s_wifi_ssid, sizeof(wc.sta.ssid));
-    memcpy(wc.sta.password, s_wifi_pass, sizeof(wc.sta.password));
-    esp_wifi_set_config(WIFI_IF_STA, &wc);
-    s_wifi_retry = 0;
-    esp_wifi_disconnect();
-    esp_wifi_connect();
-    ESP_LOGI(TAG, "Neue WLAN-Config: SSID '%s' -> verbinde", s_wifi_ssid);
+    int idx = wlan_add(ssid, pass);
+    if (idx < 0) { ESP_LOGW(TAG, "WLAN nicht gespeichert (Liste voll oder SSID leer)"); return; }
+    wlan_list_save();
+    wlan_connect_to(idx);
+    ESP_LOGI(TAG, "WLAN '%s' gespeichert (Prio %d, %d gesamt) -> verbinde", ssid, idx, s_wlan_count);
 }
 
 static void start_wifi(void)
@@ -466,15 +554,19 @@ static void start_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-    wifi_creds_load();
-    if (s_wifi_ssid[0]) {
+    wlan_list_load();
+    if (s_wlan_count > 0) {
+        // Startziel = hoechste Prioritaet (Index 0); Manager wechselt bei Bedarf.
+        strlcpy(s_wifi_ssid, s_wlans[0].ssid, sizeof(s_wifi_ssid));
+        strlcpy(s_wifi_pass, s_wlans[0].pass, sizeof(s_wifi_pass));
+        s_wlan_current = 0;
         wifi_config_t wc = { 0 };
         memcpy(wc.sta.ssid, s_wifi_ssid, sizeof(wc.sta.ssid));
         memcpy(wc.sta.password, s_wifi_pass, sizeof(wc.sta.password));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
-        ESP_LOGI(TAG, "WLAN-Config geladen: SSID '%s'", s_wifi_ssid);
+        ESP_LOGI(TAG, "WLAN: %d gespeichert, Start mit '%s'", s_wlan_count, s_wifi_ssid);
     } else {
-        ESP_LOGW(TAG, "Keine WLAN-Zugangsdaten -> im Webinterface setzen");
+        ESP_LOGW(TAG, "Keine WLANs -> im Webinterface setzen");
     }
     ESP_ERROR_CHECK(esp_wifi_start());
 }
@@ -746,8 +838,11 @@ static char *config_export_json(void)
     APP("version=%d\n", (int)s_cfg_version);
     APP("systemname=%s\n", s_systemname);
     APP("sn=%s\n", sn);
-    APP("wlan.ssid=%s\n", s_wifi_ssid);
-    APP("wlan.pass=%s\n", s_wifi_pass);
+    APP("wlan.count=%d\n", s_wlan_count);
+    for (int i = 0; i < s_wlan_count; i++) {
+        APP("wlan.%d.ssid=%s\n", i, s_wlans[i].ssid);
+        APP("wlan.%d.pass=%s\n", i, s_wlans[i].pass);
+    }
     APP("wg.priv=%s\n", s_wg_priv);
     APP("wg.pub=%s\n", s_wg_pub);
     APP("wg.psk=%s\n", s_wg_psk);
@@ -779,6 +874,7 @@ static bool config_import_json(char *text)
 {
     if (!text) return false;
     memset(s_res, 0, sizeof(s_res));
+    memset(s_wlans, 0, sizeof(s_wlans)); s_wlan_count = 0;
     char *line = text;
     while (line && *line) {
         char *nl = strchr(line, '\n');
@@ -791,8 +887,15 @@ static bool config_import_json(char *text)
             const char *k = line, *v = eq + 1;
             if      (!strcmp(k, "version"))       s_cfg_version = atoi(v);
             else if (!strcmp(k, "systemname"))    strlcpy(s_systemname, v, sizeof(s_systemname));
-            else if (!strcmp(k, "wlan.ssid"))     strlcpy(s_wifi_ssid, v, sizeof(s_wifi_ssid));
-            else if (!strcmp(k, "wlan.pass"))     strlcpy(s_wifi_pass, v, sizeof(s_wifi_pass));
+            else if (!strncmp(k, "wlan.", 5) && k[5] >= '0' && k[5] <= '9') {
+                int idx = atoi(k + 5);
+                const char *dot = strchr(k + 5, '.');
+                if (dot && idx >= 0 && idx < MAX_WLAN) {
+                    const char *f = dot + 1;
+                    if      (!strcmp(f, "ssid")) strlcpy(s_wlans[idx].ssid, v, sizeof(s_wlans[idx].ssid));
+                    else if (!strcmp(f, "pass")) strlcpy(s_wlans[idx].pass, v, sizeof(s_wlans[idx].pass));
+                }
+            }
             else if (!strcmp(k, "wg.priv"))       strlcpy(s_wg_priv, v, sizeof(s_wg_priv));
             else if (!strcmp(k, "wg.pub"))        strlcpy(s_wg_pub, v, sizeof(s_wg_pub));
             else if (!strcmp(k, "wg.psk"))        strlcpy(s_wg_psk, v, sizeof(s_wg_psk));
@@ -837,7 +940,21 @@ static bool config_import_json(char *text)
         s_admin_is_default = (strcmp(s_admin_phash, def) == 0);
     }
 
-    wifi_creds_save(s_wifi_ssid, s_wifi_pass);
+    // WLAN-Liste kompaktieren (nur Eintraege mit SSID), Reihenfolge = Prioritaet.
+    int wn = 0;
+    for (int i = 0; i < MAX_WLAN; i++) {
+        if (s_wlans[i].ssid[0]) {
+            if (wn != i) { s_wlans[wn] = s_wlans[i]; memset(&s_wlans[i], 0, sizeof(s_wlans[i])); }
+            wn++;
+        }
+    }
+    s_wlan_count = wn;
+    if (s_wlan_count > 0) {
+        strlcpy(s_wifi_ssid, s_wlans[0].ssid, sizeof(s_wifi_ssid));
+        strlcpy(s_wifi_pass, s_wlans[0].pass, sizeof(s_wifi_pass));
+    }
+
+    wlan_list_save();
     wg_creds_save();
     nvs_handle_t nh;
     if (nvs_open("admin", NVS_READWRITE, &nh) == ESP_OK) {
@@ -959,6 +1076,26 @@ static void send_head(httpd_req_t *req, const char *title)
 }
 
 // Ressourcenliste (RDP/Link/SSH). admin=true -> mit Loeschen-Button.
+// Gespeicherte WLANs (Prioritaet = Reihenfolge). admin=true -> hoch/loeschen.
+static void send_wlan_list(httpd_req_t *req, bool admin)
+{
+    if (s_wlan_count == 0) { httpd_resp_sendstr_chunk(req, "<div class=k>keine gespeichert</div>"); return; }
+    for (int i = 0; i < s_wlan_count; i++) {
+        const char *cur = (i == s_wlan_current && s_wifi_connected) ? " &#10003;" : "";
+        if (admin)
+            SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>"
+                "%d. <b>%s</b>%s &nbsp;"
+                "<form method=post action=/wlanup style='display:inline'><input type=hidden name=i value=%d>"
+                "<button style='font-size:11px'>hoch</button></form> "
+                "<form method=post action=/wlandel style='display:inline'><input type=hidden name=i value=%d>"
+                "<button style='font-size:11px'>löschen</button></form></div>",
+                i + 1, s_wlans[i].ssid, cur, i, i);
+        else
+            SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>%d. <b>%s</b>%s</div>",
+                  i + 1, s_wlans[i].ssid, cur);
+    }
+}
+
 static void send_res_list(httpd_req_t *req, bool admin)
 {
     if (s_res_count == 0) { httpd_resp_sendstr_chunk(req, "<div class=k>keine Ressourcen</div>"); return; }
@@ -1052,27 +1189,33 @@ static esp_err_t root_get(httpd_req_t *req)
     if (s_wifi_connected) snprintf(ipbuf, sizeof(ipbuf), IPSTR, IP2STR(&s_wifi_ip));
     else                  snprintf(ipbuf, sizeof(ipbuf), "-");
 
+    const esp_app_desc_t *app = esp_app_get_description();
     send_head(req, "ESP32 USB VPN");
     httpd_resp_sendstr_chunk(req, "<h1>ESP32-USB-VPN-Dongle</h1>"
         "<p class=ok>USB-NCM aktiv - PC per DHCP am Dongle (192.168.226.1).</p>");
+    SENDF(req, "<div class=k style='margin:-8px auto 8px'>Firmware %s (%s) &middot; Konfig v%d</div>",
+          app ? app->version : "?", FW_BUILD_TAG, (int)s_cfg_version);
 
-    // WLAN-Karte (komplett: Status, Scan, Verbinden) -- ohne Login.
+    // WLAN-Karte (Status, gespeicherte WLANs, Scan, hinzufuegen) -- ohne Login.
     SENDF(req, "<div class=card><h2>WLAN</h2>"
-        "<div class=v>Status: <b style='color:%s'>%s</b></div>"
+        "<div class=v>Status: <b style='color:%s'>%s</b>%s%s</div>"
         "<div class=v>IP vom Router: %s</div>"
         "<div class=v>Internet-Routing: <b style='color:%s'>%s</b></div>"
+        "<div class=k style='margin-top:4px'>Gespeicherte WLANs (Prioritaet):</div>",
+        s_wifi_connected ? "#43d17a" : "#f0a35e",
+        s_wifi_connected ? "verbunden" : (s_wifi_ssid[0] ? "verbinde ..." : "nicht konfiguriert"),
+        s_wifi_connected ? " mit " : "", s_wifi_connected ? s_wifi_ssid : "",
+        ipbuf,
+        (s_nat_on && s_wifi_connected) ? "#43d17a" : "#f0a35e",
+        (s_nat_on && s_wifi_connected) ? "aktiv (NAT)" : (s_nat_on ? "wartet auf WLAN" : "aus"));
+    send_wlan_list(req, false);
+    httpd_resp_sendstr_chunk(req,
         "<button type=button onclick='scan()' style='margin:6px'>Netzwerke suchen</button>"
         "<div id=nets class=v></div>"
         "<form method=post action=/wifi>"
-        "<input name=ssid placeholder=SSID value='%s' style='width:90%%;margin:3px' required><br>"
-        "<input name=pass type=password placeholder=Passwort style='width:90%%;margin:3px'><br>"
-        "<button type=submit>Verbinden / Speichern</button></form></div>",
-        s_wifi_connected ? "#43d17a" : "#f0a35e",
-        s_wifi_connected ? "verbunden" : (s_wifi_ssid[0] ? "verbinde ..." : "nicht konfiguriert"),
-        ipbuf,
-        (s_nat_on && s_wifi_connected) ? "#43d17a" : "#f0a35e",
-        (s_nat_on && s_wifi_connected) ? "aktiv (NAT)" : (s_nat_on ? "wartet auf WLAN" : "aus"),
-        s_wifi_ssid);
+        "<input name=ssid placeholder=SSID style='width:90%;margin:3px' required><br>"
+        "<input name=pass type=password placeholder=Passwort style='width:90%;margin:3px'><br>"
+        "<button type=submit>WLAN hinzufügen / verbinden</button></form></div>");
 
     // VPN nur Status (read-only).
     SENDF(req, "<div class=card><h2>VPN-Status</h2>"
@@ -1123,12 +1266,15 @@ static esp_err_t settings_get(httpd_req_t *req)
     { char sn[13]; sn_string(sn);
       SENDF(req, "<div class=card><h2>System</h2>"
         "<div class=v>Seriennummer (SN): <b>%s</b></div>"
+        "<div class=v>Firmware: <b>%s</b> (%s)</div>"
+        "<div class=v>Konfig-Version: <b>%d</b></div>"
         "<form method=post action=/sys style='font-size:13px'>"
         "<input name=name placeholder=Systemname value='%s' style='width:90%%;margin:2px'><br>"
         "<input name=secret type=password placeholder='Konfig-Secret (20 alphanum., leer=unveraendert)' style='width:90%%;margin:2px'><br>"
         "<input name=server placeholder='Config-Server-URL http://...' value='%s' style='width:90%%;margin:2px'><br>"
         "<button type=submit>Speichern</button></form></div>",
-        sn, s_systemname, s_cfg_server); }
+        sn, app ? app->version : "?", FW_BUILD_TAG, (int)s_cfg_version,
+        s_systemname, s_cfg_server); }
 
     // Konfiguration: verschluesselter Export/Import + Config-Server-Abfrage.
     SENDF(req, "<div class=card><h2>Konfiguration</h2>"
@@ -1149,6 +1295,17 @@ static esp_err_t settings_get(httpd_req_t *req)
         s_unlocked ? "#43d17a" : "#f0a35e", s_unlocked ? "frei" : "gesperrt",
         s_unlocked ? "<form method=post action=/lock><button>Sperren</button></form>"
                    : "<form method=post action=/unlock><button>Freigeben</button></form>");
+
+    // WLAN-Verwaltung: gespeicherte WLANs (Prioritaet), hoch/loeschen + hinzufuegen.
+    httpd_resp_sendstr_chunk(req, "<div class=card><h2>WLAN-Verwaltung</h2>"
+        "<div class=k>Reihenfolge = Prioritaet. Der Dongle nutzt das hoechstpriore "
+        "verfuegbare WLAN und wechselt automatisch (z. B. Hotspot &harr; Arbeitsplatz).</div>");
+    send_wlan_list(req, true);
+    httpd_resp_sendstr_chunk(req,
+        "<form method=post action=/wifi style='font-size:13px;margin-top:6px'>"
+        "<input name=ssid placeholder=SSID style='width:90%;margin:2px' required><br>"
+        "<input name=pass type=password placeholder=Passwort style='width:90%;margin:2px'><br>"
+        "<button type=submit>WLAN hinzufügen / verbinden</button></form></div>");
 
     // WireGuard-Konfig + VPN-Schalter (in 2 Chunks wegen Groesse).
     SENDF(req, "<div class=card><h2>WireGuard-VPN</h2>"
@@ -1656,6 +1813,53 @@ static esp_err_t config_apply_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// POST /wlandel (Admin): gespeichertes WLAN i loeschen.
+static esp_err_t wlandel_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[32] = {0};
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    if (len > 0) { int r = httpd_req_recv(req, body, len); if (r > 0) body[r] = 0; }
+    char v[8] = {0}; int idx = -1;
+    if (httpd_query_key_value(body, "i", v, sizeof(v)) == ESP_OK) idx = atoi(v);
+    if (idx >= 0 && idx < s_wlan_count) {
+        bool was_current = (s_wlan_current == idx);
+        for (int k = idx; k < s_wlan_count - 1; k++) s_wlans[k] = s_wlans[k + 1];
+        memset(&s_wlans[s_wlan_count - 1], 0, sizeof(wlan_t));
+        s_wlan_count--;
+        if (s_wlan_current == idx) s_wlan_current = -1;
+        else if (s_wlan_current > idx) s_wlan_current--;
+        wlan_list_save();
+        if (was_current) {
+            // Aktives Ziel geloescht -> nicht auf verwaister Config haengen bleiben.
+            if (s_wlan_count > 0) wlan_connect_to(0);
+            else { esp_wifi_disconnect(); s_wifi_ssid[0] = 0; }
+        }
+    }
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_sendstr(req, "");
+}
+// POST /wlanup (Admin): WLAN i eine Prioritaet hoeher (mit i-1 tauschen).
+static esp_err_t wlanup_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[32] = {0};
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    if (len > 0) { int r = httpd_req_recv(req, body, len); if (r > 0) body[r] = 0; }
+    char v[8] = {0}; int idx = -1;
+    if (httpd_query_key_value(body, "i", v, sizeof(v)) == ESP_OK) idx = atoi(v);
+    if (idx > 0 && idx < s_wlan_count) {
+        wlan_t tmp = s_wlans[idx - 1]; s_wlans[idx - 1] = s_wlans[idx]; s_wlans[idx] = tmp;
+        if (s_wlan_current == idx) s_wlan_current = idx - 1;
+        else if (s_wlan_current == idx - 1) s_wlan_current = idx;
+        wlan_list_save();
+    }
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_sendstr(req, "");
+}
+
 // Verfuegbare WLANs scannen -> JSON [{ssid,rssi,lock}]. Blockierender Scan (~3 s).
 static esp_err_t scan_get(httpd_req_t *req)
 {
@@ -2005,6 +2209,8 @@ static void start_http(void)
         httpd_uri_t cimp   = { .uri = "/config/import", .method = HTTP_POST, .handler = config_import_post };
         httpd_uri_t cchk   = { .uri = "/config/check",  .method = HTTP_GET,  .handler = config_check_get };
         httpd_uri_t capl   = { .uri = "/config/apply",  .method = HTTP_POST, .handler = config_apply_post };
+        httpd_uri_t wldel  = { .uri = "/wlandel", .method = HTTP_POST, .handler = wlandel_post };
+        httpd_uri_t wlup   = { .uri = "/wlanup",  .method = HTTP_POST, .handler = wlanup_post };
         httpd_uri_t any    = { .uri = "/*",      .method = HTTP_GET,  .handler = captive_redirect };
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ota);
@@ -2029,6 +2235,8 @@ static void start_http(void)
         httpd_register_uri_handler(server, &cimp);
         httpd_register_uri_handler(server, &cchk);
         httpd_register_uri_handler(server, &capl);
+        httpd_register_uri_handler(server, &wldel);
+        httpd_register_uri_handler(server, &wlup);
         httpd_register_uri_handler(server, &any);   // muss ZULETZT registriert werden
         ESP_LOGI(TAG, "HTTP-Server auf 192.168.226.1 gestartet");
     } else {
@@ -2194,6 +2402,7 @@ void app_main(void)
         if (s_wg_reconnect) { s_wg_reconnect = false; wg_stop(); }  // Config-Wechsel
         // Admin-Schalter "VPN-AUS": laufenden Tunnel trennen + Gate nachziehen.
         if (s_vpn_off && s_wg_started) { wg_stop(); update_internet_gate(); }
+        wlan_manager();     // Mehrere WLANs: Ausfall-/Prioritaets-Umschaltung
         wg_poll();          // WireGuard-Peer-Status pruefen (+ LED)
         update_internet_gate();  // idempotent: NAPT-Gate an Zustand angleichen (Default entsperrt)
         // Config-Server: EINMALIG 3 min nach WLAN-Connect nachsehen (sonst manuell).

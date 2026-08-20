@@ -95,9 +95,18 @@ function New-ConfigGuided {
     $lines.Add('schema=1')
     $lines.Add('version=' + (Read-Def 'Config-Version (Ganzzahl, hoeher = neuer)' '1'))
     $lines.Add('systemname=' + (Read-Def 'Systemname' 'Dongle'))
-    Write-Host "-- WLAN --"
-    $lines.Add('wlan.ssid=' + (Read-Def 'WLAN SSID' ''))
-    $lines.Add('wlan.pass=' + (Read-Def 'WLAN Passwort' ''))
+    Write-Host "-- WLANs (mehrere moeglich, Reihenfolge = Prioritaet; Enter bei SSID beendet) --"
+    $wi = 0
+    $wlanLines = New-Object System.Collections.Generic.List[string]
+    while ($true) {
+        $ws = Read-Host ("WLAN #{0} SSID (leer=fertig)" -f $wi)
+        if ([string]::IsNullOrEmpty($ws)) { break }
+        $wp = Read-Def '  Passwort' ''
+        $wlanLines.Add("wlan.$wi.ssid=$ws"); $wlanLines.Add("wlan.$wi.pass=$wp")
+        $wi++
+    }
+    $lines.Add("wlan.count=$wi")
+    $lines.AddRange($wlanLines)
     Write-Host "-- WireGuard --"
     $lines.Add('wg.priv=' + (Read-Def 'WG Private Key' ''))
     $lines.Add('wg.pub=' + (Read-Def 'WG Peer Public Key' ''))
