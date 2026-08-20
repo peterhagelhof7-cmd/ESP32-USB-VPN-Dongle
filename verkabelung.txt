@@ -1,0 +1,79 @@
+===============================================================================
+ ESP32-USB-VPN-Dongle  -  Verkabelungsdiagramm
+===============================================================================
+ HW-Basis : Wemos S2 Mini (ESP32-S2, natives USB-OTG, USB-C)
+ Anzeige  : KY-016 RGB-LED-Modul (gemeinsame KATHODE, mit Onboard-Widerstaenden)
+ Stromvers.: komplett ueber USB-C vom PC (kein externes Netzteil noetig)
+ Stand    : 2026-08-20   (Firmware: LED_R=GPIO5, LED_G=GPIO6, LED_B=GPIO7)
+===============================================================================
+
+
+ UEBERSICHT
+ ----------
+
+        USB-C                +-------------------------+
+   PC =========== USB ======>|      Wemos S2 Mini      |
+   (Daten + 5V Strom)        |        (ESP32-S2)       |
+                             |                         |
+                             |   GPIO5 (R) o-----------+---[R]--> KY-016  R
+                             |   GPIO6 (G) o-----------+---[G]--> KY-016  G
+                             |   GPIO7 (B) o-----------+---[B]--> KY-016  B
+                             |        GND  o-----------+--------> KY-016  - (GND)
+                             +-------------------------+
+                                                        [R/G/B] = Onboard-Wider-
+                                                        staende auf dem KY-016
+
+
+ PIN-BELEGUNG
+ ------------
+
+   Wemos S2 Mini      Draht        KY-016 (RGB-LED-Modul)
+   -------------------------------------------------------
+   GPIO5   ---------------------->  R   (rote Anode)
+   GPIO6   ---------------------->  G   (gruene Anode)
+   GPIO7   ---------------------->  B   (blaue Anode)
+   GND     ---------------------->  -   (gemeinsame Kathode / GND)
+
+   Logik: gemeinsame Kathode -> GPIO HIGH = LED-Segment AN, LOW = AUS.
+   Die Strombegrenzung erledigen die Widerstaende auf dem KY-016-Modul,
+   daher direkte Verbindung ohne zusaetzliche Vorwiderstaende moeglich.
+
+
+ KY-016 MODUL (typ. 4-Pin-Ausfuehrung)
+ -------------------------------------
+
+        +-----------------+
+        |   (o)  RGB-LED   |
+        |    KY-016        |
+        |                  |
+        |  R   G   B   -   |
+        +--|---|---|---|---+
+           |   |   |   |
+         GPIO5 |   |  GND
+             GPIO6 |
+                 GPIO7
+
+   Hinweis: Die Pin-Reihenfolge/Beschriftung variiert je nach KY-016-Charge
+   (manche: '-'/G/R/B). Immer nach den Aufdrucken R, G, B und '-' (GND)
+   verdrahten, nicht nach der Position.
+
+
+ STATUS-LED BEDEUTUNG (Firmware)
+ -------------------------------
+   ROT    = kein Uplink (WLAN nicht verbunden)
+   BLAU   = WLAN verbunden (Uplink steht, VPN noch nicht)
+   GRUEN  = VPN-Tunnel aktiv (WireGuard-Handshake ok)
+
+
+ HINWEISE
+ --------
+ * GPIO5/6/7 sind auf dem ESP32-S2 freie, unkritische GPIOs (keine
+   Boot-Strapping-Funktion) -> sicher fuer die LED nutzbar.
+ * Kein weiteres Bauteil noetig: der USB-C-Anschluss liefert Daten UND Strom.
+   Der Dongle meldet sich am PC treiberlos als USB-Netzwerkadapter (NCM).
+ * Nach dem ERSTFLASH meldet sich der S2 als Netzwerkadapter statt als
+   COM-Port. Zum Neuflashen in den Download-Modus: BOOT (GPIO0) halten,
+   RST kurz tippen, BOOT loslassen. Danach Updates bequem per OTA.
+ * Pins sind in firmware/main/main.c definiert (LED_R/G/B_PIN) und koennen
+   bei anderer Verdrahtung dort angepasst werden.
+===============================================================================
