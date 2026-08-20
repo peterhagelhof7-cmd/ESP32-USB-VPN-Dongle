@@ -31,7 +31,12 @@
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
 #include "esp_core_dump.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_spiffs.h"
 #include "driver/gpio.h"
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
@@ -46,7 +51,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "rxfix"
+#define FW_BUILD_TAG "webui2"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -572,166 +577,326 @@ static bool require_auth(httpd_req_t *req)
 }
 
 // --- HTTP-Testseite + OTA-Update --------------------------------------------
+// === Web-UI v2 ===============================================================
+// Oeffentliche Startseite "/" (ohne Login): WLAN komplett, VPN nur Status,
+// Ressourcen/Dateien zum Download. Einstellungsseite "/settings" (Login):
+// System-Status, WireGuard-Konfig, Admin, Ressourcenmanager + Datei-Upload,
+// Reset, OTA. Gerendert per Chunked-Response (kein Riesen-snprintf).
+
+// --- Datei-Ablage (SPIFFS 'storage'-Partition, fuer Upload/Download) --------
+#define SPIFFS_BASE "/spiffs"
+static bool s_spiffs_ok;
+static void storage_init(void)
+{
+    esp_vfs_spiffs_conf_t c = {
+        .base_path = SPIFFS_BASE, .partition_label = "storage",
+        .max_files = 4, .format_if_mount_failed = true,
+    };
+    s_spiffs_ok = (esp_vfs_spiffs_register(&c) == ESP_OK);
+    if (!s_spiffs_ok) ESP_LOGW(TAG, "SPIFFS 'storage' mount fehlgeschlagen");
+}
+static void storage_usage(size_t *total, size_t *used)
+{
+    *total = 0; *used = 0;
+    if (s_spiffs_ok) esp_spiffs_info("storage", total, used);
+}
+// Dateinamen auf sichere Zeichen beschraenken (kein Pfad-Traversal).
+static bool sanitize_name(const char *in, char *out, size_t n)
+{
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 1 < n; i++) {
+        char ch = in[i];
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-')
+            out[o++] = ch;
+    }
+    out[o] = 0;
+    return o > 0;
+}
+
+// Chunk-Helfer: formatiert + sendet ein HTML-Fragment.
+#define SENDF(req, ...) do { char _sb[1600]; snprintf(_sb, sizeof(_sb), __VA_ARGS__); \
+                             httpd_resp_sendstr_chunk((req), _sb); } while (0)
+
+static const char PAGE_CSS[] =
+    "<style>body{font-family:sans-serif;background:#0f1626;color:#e6e6e6;"
+    "text-align:center;padding:24px}h1{color:#5cc8ff}.ok{color:#43d17a}"
+    ".card{background:#16203c;border:1px solid #33406a;border-radius:10px;"
+    "max-width:480px;margin:16px auto;padding:16px;text-align:left}"
+    "h2{color:#5cc8ff;font-size:16px;margin:0 0 8px;border-bottom:1px solid #33406a;padding-bottom:4px}"
+    "button{padding:8px 14px}a{color:#5cc8ff}.k{color:#8ab4f8;font-size:13px}.v{font-size:13px}"
+    "input,select{padding:6px;border-radius:6px;border:1px solid #33406a;background:#0f1626;color:#e6e6e6}"
+    "progress{width:100%;margin-top:8px}</style>";
+
+static const char SCAN_JS[] =
+    "<script>function scan(){var d=document.getElementById('nets');d.textContent='scanne ...';"
+    "fetch('/scan').then(function(r){return r.json();}).then(function(a){d.innerHTML='';"
+    "a.forEach(function(n){var b=document.createElement('button');b.type='button';"
+    "b.style.cssText='display:block;width:92%;margin:2px auto';"
+    "b.textContent=(n.lock?'* ':'  ')+n.ssid+' ('+n.rssi+' dBm)';"
+    "b.onclick=function(){document.getElementsByName('ssid')[0].value=n.ssid;};"
+    "d.appendChild(b);});if(!a.length){d.textContent='keine Netze gefunden';}"
+    "}).catch(function(){d.textContent='Scan-Fehler';});}</script>";
+
+static const char UPLOAD_JS[] =
+    "<form id=uf style='margin-top:8px'><input type=file id=uff required> "
+    "<button type=submit>Datei hochladen</button></form><div id=ust class=v></div>"
+    "<script>uf.onsubmit=function(e){e.preventDefault();var f=uff.files[0];if(!f)return;"
+    "var x=new XMLHttpRequest();x.open('POST','/upload?name='+encodeURIComponent(f.name));"
+    "x.onload=function(){ust.textContent=x.responseText;if(x.status==200)setTimeout(function(){location.reload();},800);};"
+    "x.onerror=function(){ust.textContent='Fehler';};x.send(f);};</script>";
+
+static const char OTA_JS[] =
+    "<script>f.onsubmit=function(e){e.preventDefault();var file=fw.files[0];if(!file)return;"
+    "var x=new XMLHttpRequest();x.open('POST','/ota');p.hidden=false;"
+    "x.upload.onprogress=function(ev){var v=Math.round(ev.loaded/ev.total*100);p.value=v;st.textContent=v+'%';};"
+    "x.onload=function(){st.textContent=x.responseText;if(x.status==200)setTimeout(function(){location.reload();},5000);};"
+    "x.onerror=function(){st.textContent='Fehler beim Upload';};x.send(file);};</script>";
+
+static void send_head(httpd_req_t *req, const char *title)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr_chunk(req, "<!doctype html><html><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'><title>");
+    httpd_resp_sendstr_chunk(req, title);
+    httpd_resp_sendstr_chunk(req, "</title>");
+    httpd_resp_sendstr_chunk(req, PAGE_CSS);
+    httpd_resp_sendstr_chunk(req, "</head><body>");
+}
+
+// Ressourcenliste (RDP/Link/SSH). admin=true -> mit Loeschen-Button.
+static void send_res_list(httpd_req_t *req, bool admin)
+{
+    if (s_res_count == 0) { httpd_resp_sendstr_chunk(req, "<div class=k>keine Ressourcen</div>"); return; }
+    for (int i = 0; i < s_res_count; i++) {
+        resource_t *r = &s_res[i];
+        char action[200];
+        if (strcmp(r->type, "link") == 0)
+            snprintf(action, sizeof(action), "<a href='%s' target=_blank>Oeffnen</a>", r->addr);
+        else if (strcmp(r->type, "ssh") == 0)
+            snprintf(action, sizeof(action), "<a href='ssh://%s'>SSH</a>", r->addr);
+        else
+            snprintf(action, sizeof(action), "<a href='/rdp?i=%d'>RDP herunterladen</a>", i);
+        if (admin)
+            SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>"
+                "<b>%s</b> <span class=k>[%s]</span><br>%s &nbsp; "
+                "<form method=post action=/resdel style='display:inline'>"
+                "<input type=hidden name=i value=%d><button style='font-size:11px'>loeschen</button></form></div>",
+                r->name, r->type, action, i);
+        else
+            SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>"
+                "<b>%s</b> <span class=k>[%s]</span><br>%s</div>", r->name, r->type, action);
+    }
+}
+
+// Hochgeladene Dateien. admin=true -> mit Loeschen-Button.
+static void send_file_list(httpd_req_t *req, bool admin)
+{
+    DIR *d = opendir(SPIFFS_BASE);
+    int n = 0;
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            char full[300]; struct stat stt; char sz[24] = "";
+            snprintf(full, sizeof(full), SPIFFS_BASE "/%s", e->d_name);
+            if (stat(full, &stt) == 0) {
+                if (!S_ISREG(stt.st_mode)) continue;
+                snprintf(sz, sizeof(sz), " (%ld B)", (long)stt.st_size);
+            }
+            n++;
+            if (admin)
+                SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>"
+                    "<a href='/dl?name=%s'>%s</a>%s &nbsp; "
+                    "<form method=post action=/delfile style='display:inline'>"
+                    "<input type=hidden name=name value='%s'><button style='font-size:11px'>loeschen</button></form></div>",
+                    e->d_name, e->d_name, sz, e->d_name);
+            else
+                SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>"
+                    "<a href='/dl?name=%s'>%s</a>%s</div>", e->d_name, e->d_name, sz);
+        }
+        closedir(d);
+    }
+    if (n == 0) httpd_resp_sendstr_chunk(req, "<div class=k>keine Dateien</div>");
+}
+
+// System-Status: Uptime, Heap, Task-Stacks, freier Datei-Speicher.
+static void send_status(httpd_req_t *req)
+{
+    unsigned upt = (unsigned)(esp_timer_get_time() / 1000000LL);
+    SENDF(req, "<div class=v>Uptime: %u s (%uh %02um %02us)</div>",
+          upt, upt / 3600, (upt % 3600) / 60, upt % 60);
+    SENDF(req, "<div class=v>Heap frei: %u B &nbsp; min. je frei: %u B</div>",
+          (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
+    SENDF(req, "<div class=v>groesster freier Block: %u B</div>",
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    size_t tot = 0, used = 0; storage_usage(&tot, &used);
+    SENDF(req, "<div class=v>Datei-Speicher: %u KB frei von %u KB</div>",
+          (unsigned)((tot - used) / 1024), (unsigned)(tot / 1024));
+    httpd_resp_sendstr_chunk(req, "<div class=k style='margin-top:6px'>Task-Stacks (kleinster freier Rest):</div>");
+#if configUSE_TRACE_FACILITY
+    UBaseType_t num = uxTaskGetNumberOfTasks();
+    TaskStatus_t *arr = malloc(num * sizeof(TaskStatus_t));
+    if (arr) {
+        num = uxTaskGetSystemState(arr, num, NULL);
+        for (UBaseType_t i = 0; i < num; i++)
+            SENDF(req, "<div class=v>%-16s %6u B</div>", arr[i].pcTaskName,
+                  (unsigned)(arr[i].usStackHighWaterMark * sizeof(StackType_t)));
+        free(arr);
+    }
+#else
+    httpd_resp_sendstr_chunk(req, "<div class=v>(Trace-Facility deaktiviert)</div>");
+#endif
+}
+
+// --- Oeffentliche Startseite (ohne Login) -----------------------------------
 static esp_err_t root_get(httpd_req_t *req)
 {
-    const esp_app_desc_t *app = esp_app_get_description();
     char ipbuf[16];
     if (s_wifi_connected) snprintf(ipbuf, sizeof(ipbuf), IPSTR, IP2STR(&s_wifi_ip));
     else                  snprintf(ipbuf, sizeof(ipbuf), "-");
-    const char *wstat = s_wifi_connected ? "verbunden"
-                        : (s_wifi_ssid[0] ? "verbinde ..." : "nicht konfiguriert");
-    const char *wcol  = s_wifi_connected ? "#43d17a" : "#f0a35e";
-    bool routing = s_nat_on && s_wifi_connected;
-    const char *rstat = routing ? "aktiv (NAT)" : (s_nat_on ? "wartet auf WLAN" : "aus");
-    const char *rcol  = routing ? "#43d17a" : "#f0a35e";
-    const char *lockbanner = s_unlocked ? ""
-        : "<p style='color:#f0a35e;font-weight:bold'>Netzwerk erfordert Anmeldung</p>";
-    const char *zcol  = s_unlocked ? "#43d17a" : "#f0a35e";
-    const char *ztext = s_unlocked ? "entsperrt (Internet frei)" : "gesperrt (kein Internet)";
-    const char *zbtn  = s_unlocked
-        ? "<form method=post action=/lock><button type=submit>Sperren</button></form>"
-        : "<form method=post action=/unlock><button type=submit>Anmelden (Internet freigeben)</button></form>";
-    const char *wgcol  = s_wg_up ? "#43d17a" : "#f0a35e";
-    const char *wgstat = s_wg_up ? "verbunden (Handshake ok)"
-        : (wg_configured() ? (s_wg_started ? "verbinde ..." : "wartet auf WLAN") : "nicht konfiguriert");
-    const char *wgmode = s_wg_default_set ? "Volltunnel aktiv (Default-Route)"
-        : (s_wg_fulltunnel ? "Volltunnel gewuenscht (wartet auf Peer)" : "nur Tunnel (kein Routing)");
-    const char *wgfull_chk = s_wg_fulltunnel ? "checked" : "";
-    const char *ks_chk  = s_killswitch ? "checked" : "";
-    const char *ksstat  = s_killswitch ? "scharf (Internet nur mit VPN)" : "aus";
-    const char *kscol   = s_killswitch ? "#43d17a" : "#8ab4f8";
-    const char *vpncol  = s_vpn_off ? "#ff6b6b" : "#43d17a";
-    const char *vpntext = s_vpn_off ? "AUS (Tunnel deaktiviert)" : "AN";
-    const char *vpnbtn  = s_vpn_off
-        ? "<form method=post action=/vpn><input type=hidden name=state value=on>"
-          "<button type=submit>VPN einschalten</button></form>"
-        : "<form method=post action=/vpn><input type=hidden name=state value=off>"
-          "<button type=submit>VPN ausschalten</button></form>";
-    const char *pwwarn  = s_admin_is_default
-        ? "<p style='color:#ff6b6b;font-weight:bold'>Standard-Passwort aktiv (admin/admin) - bitte aendern!</p>"
-        : "";
 
-    // Ressourcenliste (RDP/Link/SSH) rendern.
-    static char reslist[2400];
-    size_t ro = 0; reslist[0] = 0;
-    for (int i = 0; i < s_res_count; i++) {
-        resource_t *r = &s_res[i];
-        char action[160];
-        if (strcmp(r->type, "link") == 0)
-            snprintf(action, sizeof(action), "<a href='%s' target=_blank style='color:#5cc8ff'>Oeffnen</a>", r->addr);
-        else if (strcmp(r->type, "ssh") == 0)
-            snprintf(action, sizeof(action), "<a href='ssh://%s' style='color:#5cc8ff'>SSH</a>", r->addr);
-        else
-            snprintf(action, sizeof(action), "<a href='/rdp?i=%d' style='color:#5cc8ff'>RDP herunterladen</a>", i);
-        ro += snprintf(reslist + ro, sizeof(reslist) - ro,
-            "<div style='border-top:1px solid #33406a;padding:4px;font-size:13px'>"
-            "<b>%s</b> <span style='color:#8ab4f8'>[%s]</span><br>%s &nbsp; %s "
-            "<form method=post action=/resdel style='display:inline'>"
-            "<input type=hidden name=i value=%d><button style='font-size:11px'>loeschen</button></form></div>",
-            r->name, r->type, r->addr, action, i);
-    }
-    if (s_res_count == 0)
-        snprintf(reslist, sizeof(reslist), "<div style='font-size:13px;color:#8ab4f8'>keine Ressourcen</div>");
+    send_head(req, "ESP32 USB VPN");
+    httpd_resp_sendstr_chunk(req, "<h1>ESP32-USB-VPN-Dongle</h1>"
+        "<p class=ok>USB-NCM aktiv - PC per DHCP am Dongle (192.168.226.1).</p>");
 
-    static char page[9800];
-    snprintf(page, sizeof(page),
-        "<!doctype html><html><head><meta charset=utf-8>"
-        "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<title>ESP32 USB VPN</title>"
-        "<style>body{font-family:sans-serif;background:#0f1626;color:#e6e6e6;"
-        "text-align:center;padding:32px}h1{color:#5cc8ff}.ok{color:#43d17a}"
-        ".card{background:#16203c;border:1px solid #33406a;border-radius:10px;"
-        "max-width:460px;margin:18px auto;padding:18px}button{padding:8px 16px}"
-        "input{padding:6px;border-radius:6px;border:1px solid #33406a;"
-        "background:#0f1626;color:#e6e6e6}progress{width:100%%;margin-top:8px}"
-        "</style></head><body>"
-        "<h1>ESP32-USB-VPN-Dongle</h1>"
-        "<p class=ok>USB-NCM aktiv - PC per DHCP am Dongle (192.168.226.1).</p>"
-        "%s"   /* Sperr-Banner */
-        "%s"   /* Passwort-Warnung */
-        "<div class=card><b>Zugang</b>"
-        "<div style='font-size:13px'>Status: <b style='color:%s'>%s</b></div>"
-        "%s</div>"
-        "<div class=card><b>WLAN-Uplink</b>"
-        "<div style='font-size:13px'>Status: <b style='color:%s'>%s</b></div>"
-        "<div style='font-size:13px'>IP vom Router: %s</div>"
-        "<div style='font-size:13px'>Internet-Routing: <b style='color:%s'>%s</b></div>"
+    // WLAN-Karte (komplett: Status, Scan, Verbinden) -- ohne Login.
+    SENDF(req, "<div class=card><h2>WLAN</h2>"
+        "<div class=v>Status: <b style='color:%s'>%s</b></div>"
+        "<div class=v>IP vom Router: %s</div>"
+        "<div class=v>Internet-Routing: <b style='color:%s'>%s</b></div>"
         "<button type=button onclick='scan()' style='margin:6px'>Netzwerke suchen</button>"
-        "<div id=nets style='font-size:13px;margin:4px 0'></div>"
+        "<div id=nets class=v></div>"
         "<form method=post action=/wifi>"
         "<input name=ssid placeholder=SSID value='%s' style='width:90%%;margin:3px' required><br>"
         "<input name=pass type=password placeholder=Passwort style='width:90%%;margin:3px'><br>"
-        "<button type=submit>Verbinden / Speichern</button></form></div>"
-        "<div class=card><b>WireGuard-VPN</b>"
-        "<div style='font-size:13px'>Tunnel: <b style='color:%s'>%s</b></div>"
-        "<div style='font-size:13px'>Endpoint: %s:%d</div>"
-        "<div style='font-size:13px'>Routing: %s</div>"
-        "<div style='font-size:13px'>Kill-Switch: <b style='color:%s'>%s</b></div>"
-        "<div style='font-size:13px'>VPN-Schalter: <b style='color:%s'>%s</b></div>"
-        "%s"   /* VPN an/aus (nur Admin) */
-        "<form method=post action=/wg style='font-size:13px'>"
+        "<button type=submit>Verbinden / Speichern</button></form></div>",
+        s_wifi_connected ? "#43d17a" : "#f0a35e",
+        s_wifi_connected ? "verbunden" : (s_wifi_ssid[0] ? "verbinde ..." : "nicht konfiguriert"),
+        ipbuf,
+        (s_nat_on && s_wifi_connected) ? "#43d17a" : "#f0a35e",
+        (s_nat_on && s_wifi_connected) ? "aktiv (NAT)" : (s_nat_on ? "wartet auf WLAN" : "aus"),
+        s_wifi_ssid);
+
+    // VPN nur Status (read-only).
+    SENDF(req, "<div class=card><h2>VPN-Status</h2>"
+        "<div class=v>Tunnel: <b style='color:%s'>%s</b></div>"
+        "<div class=v>Endpoint: %s:%d</div>"
+        "<div class=v>Routing: %s</div>"
+        "<div class=v>Kill-Switch: %s</div></div>",
+        s_wg_up ? "#43d17a" : "#f0a35e",
+        s_wg_up ? "verbunden" : (wg_configured() ? (s_vpn_off ? "deaktiviert"
+            : (s_wg_started ? "verbinde ..." : "wartet auf WLAN")) : "nicht konfiguriert"),
+        s_wg_endpoint, s_wg_port,
+        s_wg_default_set ? "Volltunnel aktiv" : (s_wg_fulltunnel ? "Volltunnel (wartet)" : "nur Tunnel"),
+        s_killswitch ? "scharf" : "aus");
+
+    // Ressourcen + Dateien zum Download (read-only).
+    httpd_resp_sendstr_chunk(req, "<div class=card><h2>Ressourcen / Downloads</h2>");
+    send_res_list(req, false);
+    httpd_resp_sendstr_chunk(req, "<div class=k style='margin-top:6px'>Dateien:</div>");
+    send_file_list(req, false);
+    httpd_resp_sendstr_chunk(req, "</div>");
+
+    httpd_resp_sendstr_chunk(req, "<div class=card><a href='/settings'>&#9881; Einstellungen (Anmeldung erforderlich)</a></div>");
+    httpd_resp_sendstr_chunk(req, SCAN_JS);
+    httpd_resp_sendstr_chunk(req, "</body></html>");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
+// --- Einstellungsseite (Login) ----------------------------------------------
+static esp_err_t settings_get(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    const esp_app_desc_t *app = esp_app_get_description();
+
+    send_head(req, "Einstellungen");
+    httpd_resp_sendstr_chunk(req, "<h1>Einstellungen</h1>"
+        "<div class=card><a href='/'>&#8592; zur Startseite</a></div>");
+    if (s_admin_is_default)
+        httpd_resp_sendstr_chunk(req, "<div class=card style='color:#ff6b6b'>"
+            "<b>Standard-Passwort aktiv (admin/admin) - bitte aendern!</b></div>");
+
+    // System-Status.
+    httpd_resp_sendstr_chunk(req, "<div class=card><h2>System-Status</h2>");
+    send_status(req);
+    httpd_resp_sendstr_chunk(req, "</div>");
+
+    // Internet-Zugang (Captive).
+    SENDF(req, "<div class=card><h2>Internet-Zugang</h2>"
+        "<div class=v>Status: <b style='color:%s'>%s</b></div>%s</div>",
+        s_unlocked ? "#43d17a" : "#f0a35e", s_unlocked ? "frei" : "gesperrt",
+        s_unlocked ? "<form method=post action=/lock><button>Sperren</button></form>"
+                   : "<form method=post action=/unlock><button>Freigeben</button></form>");
+
+    // WireGuard-Konfig + VPN-Schalter (in 2 Chunks wegen Groesse).
+    SENDF(req, "<div class=card><h2>WireGuard-VPN</h2>"
+        "<div class=v>Tunnel: <b style='color:%s'>%s</b> &nbsp; VPN-Schalter: <b style='color:%s'>%s</b></div>%s",
+        s_wg_up ? "#43d17a" : "#f0a35e", s_wg_up ? "verbunden" : "getrennt",
+        s_vpn_off ? "#ff6b6b" : "#43d17a", s_vpn_off ? "AUS" : "AN",
+        s_vpn_off ? "<form method=post action=/vpn><input type=hidden name=state value=on><button>VPN einschalten</button></form>"
+                  : "<form method=post action=/vpn><input type=hidden name=state value=off><button>VPN ausschalten</button></form>");
+    SENDF(req, "<form method=post action=/wg style='font-size:13px'>"
         "<input name=priv type=password placeholder='Private Key (leer=unveraendert)' style='width:90%%;margin:2px'><br>"
         "<input name=pub placeholder='Peer Public Key' value='%s' style='width:90%%;margin:2px' required><br>"
         "<input name=psk type=password placeholder='Preshared Key (optional)' style='width:90%%;margin:2px'><br>"
         "<input name=ep placeholder='Endpoint Host/IP' value='%s' style='width:58%%;margin:2px' required>"
         "<input name=port placeholder=Port value='%d' style='width:28%%;margin:2px'><br>"
-        "<input name=addr placeholder='Tunnel-IP z.B. 10.0.0.2' value='%s' style='width:58%%;margin:2px' required>"
+        "<input name=addr placeholder='Tunnel-IP' value='%s' style='width:58%%;margin:2px' required>"
         "<input name=mask placeholder=Maske value='%s' style='width:28%%;margin:2px'><br>"
         "<input name=ka placeholder='Keepalive s' value='%d' style='width:40%%;margin:2px'><br>"
-        "<label><input type=checkbox name=full value=1 %s> Volltunnel (ganzer PC-Verkehr durch VPN)</label><br>"
-        "<label><input type=checkbox name=ks value=1 %s> Kill-Switch (kein Internet ohne VPN)</label><br>"
-        "<button type=submit>Tunnel speichern + verbinden</button></form></div>"
-        "<div class=card><b>Admin-Zugang</b>"
-        "<div style='font-size:13px'>Benutzer: %s</div>"
+        "<label><input type=checkbox name=full value=1 %s> Volltunnel</label><br>"
+        "<label><input type=checkbox name=ks value=1 %s> Kill-Switch</label><br>"
+        "<button type=submit>Tunnel speichern + verbinden</button></form></div>",
+        s_wg_pub, s_wg_endpoint, s_wg_port, s_wg_addr, s_wg_netmask, s_wg_keepalive,
+        s_wg_fulltunnel ? "checked" : "", s_killswitch ? "checked" : "");
+
+    // Admin-Zugang.
+    SENDF(req, "<div class=card><h2>Admin-Zugang</h2><div class=v>Benutzer: %s</div>"
         "<form method=post action=/admin style='font-size:13px'>"
-        "<input name=user placeholder='Benutzer (optional)' value='%s' style='width:90%%;margin:2px'><br>"
+        "<input name=user placeholder=Benutzer value='%s' style='width:90%%;margin:2px'><br>"
         "<input name=pass type=password placeholder='Neues Passwort' style='width:90%%;margin:2px' required><br>"
-        "<button type=submit>Passwort speichern</button></form></div>"
-        "<div class=card><b>Interne Ressourcen</b>"
-        "%s"
-        "<form method=post action=/res style='font-size:13px'>"
-        "<input name=name placeholder=Name style='width:90%%;margin:2px' required><br>"
-        "<select name=type style='margin:2px'>"
-        "<option value=rdp>RDP</option><option value=link>Link</option><option value=ssh>SSH</option>"
-        "</select> "
-        "<input name=addr placeholder='Adresse / URL' style='width:50%%;margin:2px' required>"
-        "<input name=port placeholder=Port style='width:18%%;margin:2px'><br>"
-        "<button type=submit>Ressource hinzufuegen</button></form></div>"
-        "<div class=card><b>Firmware-Update (OTA)</b>"
-        "<div style='font-size:13px;color:#8ab4f8'>Version: %s</div>"
-        "<div style='font-size:13px;color:#8ab4f8'>Build: %s</div>"
-        "<div style='font-size:13px;color:#8ab4f8'>Aktive Partition: %s</div>"
-        "<form id=f><input type=file id=fw accept='.bin' required>"
+        "<button type=submit>Passwort speichern</button></form></div>",
+        s_admin_user, s_admin_user);
+
+    // Ressourcenmanager (anlegen/loeschen + Datei-Upload + freier Speicher).
+    httpd_resp_sendstr_chunk(req, "<div class=card><h2>Ressourcenmanager</h2>");
+    send_res_list(req, true);
+    httpd_resp_sendstr_chunk(req,
+        "<form method=post action=/res style='font-size:13px;margin-top:6px'>"
+        "<input name=name placeholder=Name style='width:90%;margin:2px' required><br>"
+        "<select name=type style='margin:2px'><option value=rdp>RDP</option>"
+        "<option value=link>Link</option><option value=ssh>SSH</option></select> "
+        "<input name=addr placeholder='Adresse / URL' style='width:50%;margin:2px' required>"
+        "<input name=port placeholder=Port style='width:18%;margin:2px'><br>"
+        "<button type=submit>Ressource hinzufuegen</button></form>");
+    { size_t tot = 0, used = 0; storage_usage(&tot, &used);
+      SENDF(req, "<div class=k style='margin-top:8px'>Dateien (frei: %u / %u KB):</div>",
+            (unsigned)((tot - used) / 1024), (unsigned)(tot / 1024)); }
+    send_file_list(req, true);
+    httpd_resp_sendstr_chunk(req, UPLOAD_JS);
+    httpd_resp_sendstr_chunk(req, "</div>");
+
+    // Zuruecksetzen.
+    httpd_resp_sendstr_chunk(req, "<div class=card><h2>Zuruecksetzen</h2>"
+        "<form method=post action=/reset onsubmit=\"return confirm('Wirklich zuruecksetzen? Das Geraet startet neu.')\">"
+        "<button name=scope value=wifi>nur WLAN</button> "
+        "<button name=scope value=wg>nur VPN</button><br><br>"
+        "<button name=scope value=wifiwg>WLAN + VPN</button> "
+        "<button name=scope value=all style='color:#ff6b6b'>ALLES (Werksreset)</button>"
+        "</form></div>");
+
+    // Firmware-Update (OTA).
+    SENDF(req, "<div class=card><h2>Firmware-Update (OTA)</h2>"
+        "<div class=k>Version: %s &nbsp; Build: %s &nbsp; Partition: %s</div>"
+        "<form id=f><input type=file id=fw accept='.bin' required> "
         "<button type=submit>Update einspielen</button></form>"
-        "<progress id=p max=100 value=0 hidden></progress>"
-        "<div id=st style='font-size:13px'></div></div>"
-        "<script>"
-        "function scan(){var d=document.getElementById('nets');d.textContent='scanne ...';"
-        "fetch('/scan').then(function(r){return r.json();}).then(function(a){d.innerHTML='';"
-        "a.forEach(function(n){var b=document.createElement('button');b.type='button';"
-        "b.style.cssText='display:block;width:92%%;margin:2px auto';"
-        "b.textContent=(n.lock?'* ':'  ')+n.ssid+' ('+n.rssi+' dBm)';"
-        "b.onclick=function(){document.getElementsByName('ssid')[0].value=n.ssid;};"
-        "d.appendChild(b);});if(!a.length){d.textContent='keine Netze gefunden';}"
-        "}).catch(function(){d.textContent='Scan-Fehler';});}"
-        "f.onsubmit=function(e){e.preventDefault();var file=fw.files[0];"
-        "if(!file)return;var x=new XMLHttpRequest();x.open('POST','/ota');"
-        "p.hidden=false;x.upload.onprogress=function(ev){var v=Math.round("
-        "ev.loaded/ev.total*100);p.value=v;st.textContent=v+'%%';};"
-        "x.onload=function(){st.textContent=x.responseText;"
-        "if(x.status==200)setTimeout(function(){location.reload();},5000);};"
-        "x.onerror=function(){st.textContent='Fehler beim Upload';};"
-        "x.send(file);};</script></body></html>",
-        lockbanner, pwwarn, zcol, ztext, zbtn,
-        wcol, wstat, ipbuf, rcol, rstat, s_wifi_ssid,
-        wgcol, wgstat, s_wg_endpoint, s_wg_port, wgmode, kscol, ksstat,
-        vpncol, vpntext, vpnbtn, s_wg_pub,
-        s_wg_endpoint, s_wg_port, s_wg_addr, s_wg_netmask, s_wg_keepalive, wgfull_chk, ks_chk,
-        s_admin_user, s_admin_user, reslist,
-        app ? app->version : "?", FW_BUILD_TAG,
-        esp_ota_get_running_partition()->label);
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_sendstr(req, page);
+        "<progress id=p max=100 value=0 hidden></progress><div id=st class=v></div></div>",
+        app ? app->version : "?", FW_BUILD_TAG, esp_ota_get_running_partition()->label);
+    httpd_resp_sendstr_chunk(req, OTA_JS);
+    httpd_resp_sendstr_chunk(req, "</body></html>");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
 }
 
 // OTA: roher .bin-Body in die inaktive Partition schreiben, dann Neustart.
@@ -789,7 +954,7 @@ static void url_decode(char *dst, const char *src, size_t dst_size)
 // WLAN-Zugangsdaten aus dem Webformular uebernehmen (ssid=...&pass=...).
 static esp_err_t wifi_post(httpd_req_t *req)
 {
-    if (!require_auth(req)) return ESP_OK;
+    // Oeffentlich (WLAN-Einrichtung ohne Login).
     char body[256];
     int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
     int r = httpd_req_recv(req, body, len);
@@ -831,7 +996,7 @@ static esp_err_t admin_post(httpd_req_t *req)
     admin_save(user[0] ? user : s_admin_user, pass);
     ESP_LOGI(TAG, "Admin-Zugang geaendert (User '%s')", s_admin_user);
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_sendstr(req, "");
 }
 
@@ -883,7 +1048,7 @@ static esp_err_t res_post(httpd_req_t *req)
         ESP_LOGI(TAG, "Ressource hinzugefuegt: %s (%s)", r.name, r.type);
     }
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_sendstr(req, "");
 }
 
@@ -905,14 +1070,116 @@ static esp_err_t resdel_post(httpd_req_t *req)
         }
     }
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Location", "/settings");
+    return httpd_resp_sendstr(req, "");
+}
+
+// --- Reset (Admin): NVS-Namespaces loeschen + Neustart ----------------------
+static void nvs_erase_ns(const char *ns)
+{
+    nvs_handle_t h;
+    if (nvs_open(ns, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h); nvs_commit(h); nvs_close(h);
+    }
+}
+static esp_err_t reset_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[48] = {0};
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    if (len > 0) { int r = httpd_req_recv(req, body, len); if (r > 0) body[r] = 0; }
+    char v[16] = {0};
+    httpd_query_key_value(body, "scope", v, sizeof(v));
+    const char *msg;
+    if      (!strcmp(v, "all"))    { nvs_flash_erase();                       msg = "Werksreset (alles)"; }
+    else if (!strcmp(v, "wifi"))   { nvs_erase_ns("wifi");                    msg = "WLAN zurueckgesetzt"; }
+    else if (!strcmp(v, "wg"))     { nvs_erase_ns("wg");                      msg = "VPN zurueckgesetzt"; }
+    else if (!strcmp(v, "wifiwg")) { nvs_erase_ns("wifi"); nvs_erase_ns("wg");msg = "WLAN+VPN zurueckgesetzt"; }
+    else { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "scope?"); return ESP_FAIL; }
+    ESP_LOGW(TAG, "RESET: %s -> Neustart", msg);
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr(req, "<!doctype html><meta charset=utf-8><body style='font-family:sans-serif;"
+        "background:#0f1626;color:#e6e6e6;text-align:center;padding:40px'>"
+        "<h2>Zurueckgesetzt - Geraet startet neu ...</h2></body>");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+// --- Datei-Upload (Admin) in die SPIFFS-Ablage ------------------------------
+static esp_err_t upload_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    if (!s_spiffs_ok) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "kein Speicher"); return ESP_FAIL; }
+    char q[160] = {0}, raw[80] = {0}, dec[80] = {0}, name[80] = {0};
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK)
+        httpd_query_key_value(q, "name", raw, sizeof(raw));
+    url_decode(dec, raw, sizeof(dec));
+    if (!sanitize_name(dec, name, sizeof(name))) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Dateiname?"); return ESP_FAIL; }
+    char path[160]; snprintf(path, sizeof(path), SPIFFS_BASE "/%s", name);
+    FILE *f = fopen(path, "wb");
+    if (!f) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "open fehlgeschlagen"); return ESP_FAIL; }
+    static char buf[1024];
+    int rem = req->content_len; bool ok = true;
+    while (rem > 0) {
+        int want = rem < (int)sizeof(buf) ? rem : (int)sizeof(buf);
+        int r = httpd_req_recv(req, buf, want);
+        if (r <= 0) { ok = false; break; }
+        if (fwrite(buf, 1, r, f) != (size_t)r) { ok = false; break; }
+        rem -= r;
+    }
+    fclose(f);
+    if (!ok) { unlink(path); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Schreibfehler (Speicher voll?)"); return ESP_FAIL; }
+    ESP_LOGI(TAG, "Upload gespeichert: %s (%d B)", name, req->content_len);
+    return httpd_resp_sendstr(req, "Upload OK");
+}
+
+// --- Datei-Download (oeffentlich) aus der SPIFFS-Ablage ---------------------
+static esp_err_t dl_get(httpd_req_t *req)
+{
+    char q[160] = {0}, raw[80] = {0}, dec[80] = {0}, name[80] = {0};
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK)
+        httpd_query_key_value(q, "name", raw, sizeof(raw));
+    url_decode(dec, raw, sizeof(dec));
+    if (!sanitize_name(dec, name, sizeof(name))) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Dateiname?"); return ESP_FAIL; }
+    char path[160]; snprintf(path, sizeof(path), SPIFFS_BASE "/%s", name);
+    FILE *f = fopen(path, "rb");
+    if (!f) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "nicht gefunden"); return ESP_FAIL; }
+    char disp[128]; snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", name);
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+    static char buf[1024]; size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) { fclose(f); return ESP_FAIL; }
+    }
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// --- Datei loeschen (Admin) -------------------------------------------------
+static esp_err_t delfile_post(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[96] = {0};
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    if (len > 0) { int r = httpd_req_recv(req, body, len); if (r > 0) body[r] = 0; }
+    char raw[80] = {0}, dec[80] = {0}, name[80] = {0};
+    httpd_query_key_value(body, "name", raw, sizeof(raw));
+    url_decode(dec, raw, sizeof(dec));
+    if (sanitize_name(dec, name, sizeof(name))) {
+        char path[160]; snprintf(path, sizeof(path), SPIFFS_BASE "/%s", name);
+        unlink(path);
+    }
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_sendstr(req, "");
 }
 
 // Verfuegbare WLANs scannen -> JSON [{ssid,rssi,lock}]. Blockierender Scan (~3 s).
 static esp_err_t scan_get(httpd_req_t *req)
 {
-    if (!require_auth(req)) return ESP_OK;
+    // Oeffentlich (WLAN-Scan gehoert zur WLAN-Einrichtung ohne Login).
     wifi_scan_config_t sc = { .show_hidden = false };
     if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Scan fehlgeschlagen");
@@ -1154,7 +1421,7 @@ static esp_err_t vpn_post(httpd_req_t *req)
     update_internet_gate();                    // Kill-Switch ggf. sofort schliessen
     ESP_LOGI(TAG, "VPN-Schalter (Admin): %s", s_vpn_off ? "AUS" : "AN");
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_sendstr(req, "");
 }
 
@@ -1165,7 +1432,7 @@ static esp_err_t unlock_post(httpd_req_t *req)
     update_internet_gate();
     ESP_LOGI(TAG, "Captive-Portal ENTSPERRT");
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_sendstr(req, "");
 }
 
@@ -1176,7 +1443,7 @@ static esp_err_t lock_post(httpd_req_t *req)
     update_internet_gate();
     ESP_LOGI(TAG, "Captive-Portal GESPERRT");
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_sendstr(req, "");
 }
 
@@ -1222,7 +1489,7 @@ static esp_err_t wg_post(httpd_req_t *req)
     update_internet_gate();   // Kill-Switch-Aenderung sofort anwenden
 
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Location", "/settings");
     return httpd_resp_sendstr(req, "");
 }
 
@@ -1230,8 +1497,8 @@ static void start_http(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    cfg.stack_size = 8192;   // OTA-Handler braucht mehr Stack
-    cfg.max_uri_handlers = 16;
+    cfg.stack_size = 12288;  // OTA + chunked Rendering (SENDF-Puffer) brauchen Stack
+    cfg.max_uri_handlers = 24;
     cfg.uri_match_fn = httpd_uri_match_wildcard;   // fuer Catch-all "/*"
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &cfg) == ESP_OK) {
@@ -1248,6 +1515,11 @@ static void start_http(void)
         httpd_uri_t res    = { .uri = "/res",     .method = HTTP_POST, .handler = res_post };
         httpd_uri_t resdel = { .uri = "/resdel",  .method = HTTP_POST, .handler = resdel_post };
         httpd_uri_t diag   = { .uri = "/diag",    .method = HTTP_GET,  .handler = diag_get };
+        httpd_uri_t setti  = { .uri = "/settings",.method = HTTP_GET,  .handler = settings_get };
+        httpd_uri_t reset  = { .uri = "/reset",   .method = HTTP_POST, .handler = reset_post };
+        httpd_uri_t upl    = { .uri = "/upload",  .method = HTTP_POST, .handler = upload_post };
+        httpd_uri_t dl     = { .uri = "/dl",      .method = HTTP_GET,  .handler = dl_get };
+        httpd_uri_t delf   = { .uri = "/delfile", .method = HTTP_POST, .handler = delfile_post };
         httpd_uri_t any    = { .uri = "/*",      .method = HTTP_GET,  .handler = captive_redirect };
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ota);
@@ -1262,6 +1534,11 @@ static void start_http(void)
         httpd_register_uri_handler(server, &res);
         httpd_register_uri_handler(server, &resdel);
         httpd_register_uri_handler(server, &diag);
+        httpd_register_uri_handler(server, &setti);
+        httpd_register_uri_handler(server, &reset);
+        httpd_register_uri_handler(server, &upl);
+        httpd_register_uri_handler(server, &dl);
+        httpd_register_uri_handler(server, &delf);
         httpd_register_uri_handler(server, &any);   // muss ZULETZT registriert werden
         ESP_LOGI(TAG, "HTTP-Server auf 192.168.226.1 gestartet");
     } else {
@@ -1401,6 +1678,7 @@ void app_main(void)
     wg_creds_load();      // Phase 5: WireGuard-Config aus NVS (vor WLAN-GOT_IP)
     admin_load();          // Phase 7: Admin-Zugang aus NVS (Default admin/admin)
     res_load();            // Phase 8: interne Ressourcen aus NVS
+    storage_init();        // SPIFFS 'storage' fuer Datei-Upload/Download mounten
     start_usb_netif();    // dann Subnetz + DHCP (nicht-fatal)
     start_wifi();          // Phase 2: WLAN-Uplink (STA)
     start_dns();           // Phase 4: DNS-Server (Captive-Hijack / Weiterleitung)

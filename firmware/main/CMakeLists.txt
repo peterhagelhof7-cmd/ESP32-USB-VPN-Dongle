@@ -8,6 +8,7 @@ idf_component_register(
                        "../.pio/libdeps/lolin_s2_mini/esp_wireguard/src"
     PRIV_REQUIRES esp_netif esp_wifi esp_http_server nvs_flash esp_event driver
                   app_update esp_app_format esp_partition espcoredump lwip mbedtls
+                  spiffs esp_timer
 )
 
 # Benutzerdefinierter lwIP-Hook (DHCP-Server Option 121). esp-idfs
