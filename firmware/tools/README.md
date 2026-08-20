@@ -33,11 +33,15 @@ PowerShell 5.1** (und neuer) ohne Zusatzmodule.
 
 # Verschlüsselte Konfig entschlüsseln/ansehen
 .\admin.ps1 -Mode decrypt -In config.json -Secret DEINSECRET20ZEICHEN
+
+# Bearbeiteten Klartext (key=value) wieder verschlüsseln
+.\admin.ps1 -Mode encrypt -In config.txt -Out config.json -Secret DEINSECRET20ZEICHEN
 ```
 
 | Parameter | Bedeutung |
 |---|---|
 | `-Mode create` | Geführte Erstellung + Verschlüsselung |
+| `-Mode encrypt` | Vorhandenen Klartext (`key=value`) verschlüsseln (z. B. nach dem Editieren eines `decrypt`-Ausdrucks) |
 | `-Mode decrypt` | Entschlüsseln und Klartext ausgeben |
 | `-In <datei>` | Eingabedatei (decrypt) |
 | `-Out <datei>` | Ausgabedatei (create), Default `config.json` |

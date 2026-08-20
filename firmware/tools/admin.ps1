@@ -17,7 +17,7 @@
     .\admin.ps1 -Mode decrypt -In cfg.bhvpn -Secret <20>
 #>
 param(
-    [ValidateSet('create', 'decrypt')] [string]$Mode,
+    [ValidateSet('create', 'encrypt', 'decrypt')] [string]$Mode,
     [string]$In,
     [string]$Out,
     [string]$Secret
@@ -151,8 +151,13 @@ if (-not $Mode) {
 if (-not $Secret) { $Secret = Read-Host 'Konfig-Secret (20 alphanumerisch)' }
 if ($Secret -notmatch '^[A-Za-z0-9]{1,20}$') { Write-Warning 'Secret sollte 1-20 alphanumerische Zeichen sein.' }
 
-if ($Mode -eq 'create') {
-    $plain = New-ConfigGuided
+if ($Mode -eq 'create' -or $Mode -eq 'encrypt') {
+    if ($Mode -eq 'create') {
+        $plain = New-ConfigGuided
+    } else {
+        if (-not $In) { $In = Read-Def 'Klartext-Konfig (key=value)' 'config.txt' }
+        $plain = (Get-Content -Path $In -Raw)
+    }
     $enc = Protect-Config $plain $Secret
     if (-not $Out) { $Out = Read-Def 'Ausgabedatei' 'config.json' }
     Set-Content -Path $Out -Value $enc -Encoding ascii -NoNewline
