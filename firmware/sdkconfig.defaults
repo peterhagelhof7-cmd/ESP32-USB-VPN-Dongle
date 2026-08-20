@@ -5,9 +5,15 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # --- TinyUSB: USB-Netzwerkklasse NCM (treiberlos auf modernem Windows/macOS) ---
 CONFIG_TINYUSB_NET_MODE_NCM=y
-# CDC-ACM zusaetzlich (Composite): serielle Log-Konsole ueber USB (Diagnose).
-CONFIG_TINYUSB_CDC_ENABLED=y
-CONFIG_TINYUSB_CDC_COUNT=1
+# CDC-ACM-Konsole AUS -> NCM-Einzelfunktion. Ein NCM+CDC-ACM-Composite (CDC als
+# Interface 0 vor NCM) bindet der NCM-Treiber von macOS/iPadOS NICHT -> Geraet
+# wird dort nur als rohes Espressif-USB-Device erkannt, kein Netzadapter.
+# NCM-only ist auf Windows + macOS + iPadOS treiberlos verifiziert.
+# Kostet die serielle Log-Konsole (COM10). Fuer Debug wieder auf y setzen
+# (ACHTUNG PlatformIO-Falle: geaenderte sdkconfig.defaults werden nur bei
+# FEHLENDER sdkconfig.<env> angewandt -> vorher firmware/sdkconfig.lolin_s2_mini
+# loeschen, sonst greift die Aenderung nicht).
+CONFIG_TINYUSB_CDC_ENABLED=n
 
 # --- lwIP: DHCP-Server + IP-Weiterleitung (spaeter fuer NAT/Routing) ---
 CONFIG_LWIP_IP_FORWARD=y

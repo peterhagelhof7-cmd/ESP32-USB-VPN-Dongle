@@ -41,8 +41,10 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_net.h"
+#if defined(CONFIG_TINYUSB_CDC_ENABLED) && CONFIG_TINYUSB_CDC_ENABLED
 #include "tinyusb_cdc_acm.h"
 #include "tinyusb_console.h"
+#endif
 
 static const char *TAG = "usbvpn";
 
@@ -51,7 +53,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "umlaut-linkfix"
+#define FW_BUILD_TAG "ncm-only"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -1569,11 +1571,19 @@ static void start_usb(void)
     ESP_ERROR_CHECK(tinyusb_net_init(&net_cfg));
 
     // CDC-ACM + Log-Konsole ueber USB (Composite) -> Logs auf zweitem COM-Port.
+    // ABSCHALTBAR: macOS' NCM-Treiber bindet bei einem NCM+CDC-ACM-Composite oft
+    // NICHT (CDC-ACM als Interface 0 vor NCM) -> Geraet wird nur als rohes
+    // Espressif-USB-Device erkannt. CONFIG_TINYUSB_CDC_ENABLED=n -> NCM-Einzel-
+    // funktion, maximal macOS-kompatibel (kostet die serielle Log-Konsole).
+#if defined(CONFIG_TINYUSB_CDC_ENABLED) && CONFIG_TINYUSB_CDC_ENABLED
     tinyusb_config_cdcacm_t acm = { .cdc_port = TINYUSB_CDC_ACM_0 };
     if (tinyusb_cdcacm_init(&acm) == ESP_OK) {
         tinyusb_console_init(TINYUSB_CDC_ACM_0);   // stdout/ESP_LOG -> USB-CDC
     }
     ESP_LOGI(TAG, "USB-NCM + CDC-Konsole installiert");
+#else
+    ESP_LOGI(TAG, "USB-NCM (NCM-only, keine CDC-Konsole)");
+#endif
 }
 
 // SCHRITT 2: USB-netif als Router mit eigenem Subnetz + DHCP-Server. NICHT-fatal:
