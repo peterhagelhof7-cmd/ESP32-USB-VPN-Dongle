@@ -51,7 +51,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "webui2"
+#define FW_BUILD_TAG "umlaut-linkfix"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -671,9 +671,12 @@ static void send_res_list(httpd_req_t *req, bool admin)
     for (int i = 0; i < s_res_count; i++) {
         resource_t *r = &s_res[i];
         char action[200];
-        if (strcmp(r->type, "link") == 0)
-            snprintf(action, sizeof(action), "<a href='%s' target=_blank>Oeffnen</a>", r->addr);
-        else if (strcmp(r->type, "ssh") == 0)
+        if (strcmp(r->type, "link") == 0) {
+            // Ohne Schema (kein "://") waere der Link relativ zur Dongle-Seite
+            // -> http:// voranstellen, damit z.B. "10.10.0.1" korrekt oeffnet.
+            const char *scheme = strstr(r->addr, "://") ? "" : "http://";
+            snprintf(action, sizeof(action), "<a href='%s%s' target=_blank>Öffnen</a>", scheme, r->addr);
+        } else if (strcmp(r->type, "ssh") == 0)
             snprintf(action, sizeof(action), "<a href='ssh://%s'>SSH</a>", r->addr);
         else
             snprintf(action, sizeof(action), "<a href='/rdp?i=%d'>RDP herunterladen</a>", i);
@@ -681,7 +684,7 @@ static void send_res_list(httpd_req_t *req, bool admin)
             SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>"
                 "<b>%s</b> <span class=k>[%s]</span><br>%s &nbsp; "
                 "<form method=post action=/resdel style='display:inline'>"
-                "<input type=hidden name=i value=%d><button style='font-size:11px'>loeschen</button></form></div>",
+                "<input type=hidden name=i value=%d><button style='font-size:11px'>löschen</button></form></div>",
                 r->name, r->type, action, i);
         else
             SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>"
@@ -708,7 +711,7 @@ static void send_file_list(httpd_req_t *req, bool admin)
                 SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>"
                     "<a href='/dl?name=%s'>%s</a>%s &nbsp; "
                     "<form method=post action=/delfile style='display:inline'>"
-                    "<input type=hidden name=name value='%s'><button style='font-size:11px'>loeschen</button></form></div>",
+                    "<input type=hidden name=name value='%s'><button style='font-size:11px'>löschen</button></form></div>",
                     e->d_name, e->d_name, sz, e->d_name);
             else
                 SENDF(req, "<div class=v style='border-top:1px solid #33406a;padding:4px'>"
@@ -727,7 +730,7 @@ static void send_status(httpd_req_t *req)
           upt, upt / 3600, (upt % 3600) / 60, upt % 60);
     SENDF(req, "<div class=v>Heap frei: %u B &nbsp; min. je frei: %u B</div>",
           (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
-    SENDF(req, "<div class=v>groesster freier Block: %u B</div>",
+    SENDF(req, "<div class=v>größter freier Block: %u B</div>",
           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     size_t tot = 0, used = 0; storage_usage(&tot, &used);
     SENDF(req, "<div class=v>Datei-Speicher: %u KB frei von %u KB</div>",
@@ -815,7 +818,7 @@ static esp_err_t settings_get(httpd_req_t *req)
         "<div class=card><a href='/'>&#8592; zur Startseite</a></div>");
     if (s_admin_is_default)
         httpd_resp_sendstr_chunk(req, "<div class=card style='color:#ff6b6b'>"
-            "<b>Standard-Passwort aktiv (admin/admin) - bitte aendern!</b></div>");
+            "<b>Standard-Passwort aktiv (admin/admin) - bitte ändern!</b></div>");
 
     // System-Status.
     httpd_resp_sendstr_chunk(req, "<div class=card><h2>System-Status</h2>");
@@ -837,7 +840,7 @@ static esp_err_t settings_get(httpd_req_t *req)
         s_vpn_off ? "<form method=post action=/vpn><input type=hidden name=state value=on><button>VPN einschalten</button></form>"
                   : "<form method=post action=/vpn><input type=hidden name=state value=off><button>VPN ausschalten</button></form>");
     SENDF(req, "<form method=post action=/wg style='font-size:13px'>"
-        "<input name=priv type=password placeholder='Private Key (leer=unveraendert)' style='width:90%%;margin:2px'><br>"
+        "<input name=priv type=password placeholder='Private Key (leer=unverändert)' style='width:90%%;margin:2px'><br>"
         "<input name=pub placeholder='Peer Public Key' value='%s' style='width:90%%;margin:2px' required><br>"
         "<input name=psk type=password placeholder='Preshared Key (optional)' style='width:90%%;margin:2px'><br>"
         "<input name=ep placeholder='Endpoint Host/IP' value='%s' style='width:58%%;margin:2px' required>"
@@ -869,7 +872,7 @@ static esp_err_t settings_get(httpd_req_t *req)
         "<option value=link>Link</option><option value=ssh>SSH</option></select> "
         "<input name=addr placeholder='Adresse / URL' style='width:50%;margin:2px' required>"
         "<input name=port placeholder=Port style='width:18%;margin:2px'><br>"
-        "<button type=submit>Ressource hinzufuegen</button></form>");
+        "<button type=submit>Ressource hinzufügen</button></form>");
     { size_t tot = 0, used = 0; storage_usage(&tot, &used);
       SENDF(req, "<div class=k style='margin-top:8px'>Dateien (frei: %u / %u KB):</div>",
             (unsigned)((tot - used) / 1024), (unsigned)(tot / 1024)); }
@@ -878,8 +881,8 @@ static esp_err_t settings_get(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "</div>");
 
     // Zuruecksetzen.
-    httpd_resp_sendstr_chunk(req, "<div class=card><h2>Zuruecksetzen</h2>"
-        "<form method=post action=/reset onsubmit=\"return confirm('Wirklich zuruecksetzen? Das Geraet startet neu.')\">"
+    httpd_resp_sendstr_chunk(req, "<div class=card><h2>Zurücksetzen</h2>"
+        "<form method=post action=/reset onsubmit=\"return confirm('Wirklich zurücksetzen? Das Gerät startet neu.')\">"
         "<button name=scope value=wifi>nur WLAN</button> "
         "<button name=scope value=wg>nur VPN</button><br><br>"
         "<button name=scope value=wifiwg>WLAN + VPN</button> "
@@ -976,7 +979,7 @@ static esp_err_t wifi_post(httpd_req_t *req)
         "<!doctype html><meta charset=utf-8>"
         "<body style='font-family:sans-serif;background:#0f1626;color:#e6e6e6;"
         "text-align:center;padding:40px'><h2>Gespeichert - verbinde mit WLAN ...</h2>"
-        "<p><a href='/' style='color:#5cc8ff'>Zurueck zur Statusseite</a></p>"
+        "<p><a href='/' style='color:#5cc8ff'>Zurück zur Statusseite</a></p>"
         "<script>setTimeout(function(){location.href='/';},4000);</script></body>");
 }
 
@@ -1100,7 +1103,7 @@ static esp_err_t reset_post(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_sendstr(req, "<!doctype html><meta charset=utf-8><body style='font-family:sans-serif;"
         "background:#0f1626;color:#e6e6e6;text-align:center;padding:40px'>"
-        "<h2>Zurueckgesetzt - Geraet startet neu ...</h2></body>");
+        "<h2>Zurückgesetzt - Gerät startet neu ...</h2></body>");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;
