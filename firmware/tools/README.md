@@ -5,6 +5,10 @@ sie mit dem Konfig-Secret (identisches Format wie die Firmware) und kann eine
 verschlüsselte Konfig wieder entschlüsseln/ansehen. Läuft auf **Windows
 PowerShell 5.1** (und neuer) ohne Zusatzmodule.
 
+> Dieses Verzeichnis enthält zwei Werkzeuge: **`admin.ps1`** (Konfig erstellen/
+> ver- & entschlüsseln, unten) und **`flash.ps1`** (Firmware bauen & flashen,
+> siehe [Abschnitt „flash.ps1"](#flashps1--firmware-bauen--flashen) am Ende).
+
 ## Wozu
 
 - **Backup/Provisionierung:** eine `.bhvpn`-Datei enthält die komplette Konfig
@@ -136,3 +140,59 @@ komplett wiederhergestellt.
   weil der **Inhalt** verschlüsselt ist; das **Secret** selbst wird nie übertragen.
 - Secret sicher aufbewahren; wer es hat, kann jede Konfig für die passende SN
   lesen/erstellen.
+
+---
+
+# flash.ps1 — Firmware bauen & flashen
+
+`flash.ps1` baut die Dongle-Firmware (PlatformIO/ESP-IDF, Env `lolin_s2_mini`)
+und flasht sie über den seriellen Download-Port auf den **Wemos S2 Mini**.
+Läuft auf **Windows PowerShell 5.1** (und neuer); benötigt eine installierte
+**PlatformIO Core** (`pio`) im PATH.
+
+## Wann brauche ich das?
+
+- **Erstflash** eines leeren/neuen Moduls.
+- **Recovery**, falls das Gerät nicht mehr per OTA erreichbar ist (z. B. nach
+  einem Boot-Loop).
+
+Im Normalbetrieb sind Updates **ohne** dieses Skript möglich: nach dem Erstflash
+meldet sich der S2 als USB-Netzwerkadapter und wird bequem **per OTA** über
+`http://192.168.226.1/` (Einstellungen → OTA) aktualisiert.
+
+## Aufruf
+
+```powershell
+# Aus firmware/tools/ (oder mit vollem Pfad) — baut + flasht, Port automatisch
+.\flash.ps1
+
+# Nur flashen (vorhandenen Build wiederverwenden)
+.\flash.ps1 -SkipBuild
+
+# Port erzwingen (wenn die Auto-Erkennung danebenliegt)
+.\flash.ps1 -Port COM17
+
+# Nach dem Flashen den seriellen Monitor öffnen
+.\flash.ps1 -Monitor
+```
+
+| Parameter | Bedeutung |
+|---|---|
+| *(ohne)* | Firmware bauen **und** flashen, Port automatisch |
+| `-SkipBuild` | Build überspringen, nur den vorhandenen Build flashen |
+| `-Port <COMx>` | Upload-Port erzwingen (sonst Auto-Erkennung) |
+| `-Monitor` | nach dem Flashen `pio device monitor` öffnen |
+
+## Wichtig: Download-Modus (S2 mit nativem USB)
+
+Der S2 nutzt **natives USB-OTG** und reagiert **nicht** auf den esptool-Auto-
+Reset (1200-bps-Touch). Nach dem ersten Flash erscheint er als **Netzwerk-
+adapter statt COM-Port**. Zum (Neu-)Flashen daher manuell in den Download-Modus:
+
+1. **BOOT (GPIO0)** gedrückt halten,
+2. **RST** kurz tippen,
+3. **BOOT** loslassen.
+
+Danach erscheint wieder ein serieller Port und `flash.ps1` (bzw. die Auto-
+Erkennung) flasht. Nach dem Flashen **USB neu einstecken** → der Dongle meldet
+sich als Netzwerkadapter, Web-UI unter `http://192.168.226.1/`.

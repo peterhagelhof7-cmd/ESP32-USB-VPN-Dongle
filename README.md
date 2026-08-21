@@ -39,11 +39,16 @@ Vollständige Konzeptbeschreibung: `ESP32-USB-VPN-Dongle.txt`.
    gewinnt ohne Metrik-Gefummel), Split als WG-Remote-Subnetz. Kein manuelles
    `route add` mehr nötig; PC braucht nur einen DHCP-Renew (Neu-Einstecken).
    *(HW-verifiziert: PC routet automatisch durch den Tunnel, 0 % Verlust.)*
-10. ⬜ Performance/Stabilität (Durchsatzmessung, Ziel 10 Mbit WLAN / 5 Mbit VPN).
+10. 🔧 Performance/Stabilität. Gemessener VPN-Durchsatz aktuell **~1,4–2,2 Mbit/s**
+    (SMB durch den Tunnel, Datenintegrität einwandfrei) – unter dem Ziel von
+    5 Mbit VPN; Grenze ist der Single-Core-S2 (USB+WLAN+ChaCha ohne Krypto-HW).
+    Details: `docs/smb-durchsatz-test.md`.
+
+**Treiberlos verifiziert auf Windows, macOS und iPadOS** (NCM-only, CDC-Konsole aus).
 
 **Offen:** echter Split-Tunnel-Datenpfad (Option 121 pusht das WG-Subnetz bereits,
 aber die Firmware muss es im Split-Modus noch als `allowed_ip` eintragen);
-LAN-Isolation; NVS-Verschlüsselung; macOS; Durchsatzmessung.
+LAN-Isolation; NVS-Verschlüsselung; Durchsatz-Optimierung.
 
 ### Diagnose / Bordmittel
 - `GET /diag?ip=<ziel>[&if=wg|any]` (Admin): ICMP-Ping **vom Gerät selbst** durch
@@ -71,4 +76,8 @@ Recovery: Download-Modus (BOOT halten, RST tippen), dann `tools/flash.ps1`.
 - macOS + DHCP-Option 121 (Split-Tunnel-Routing) evtl. unzuverlässig.
 
 ## Bauen / Flashen
-ESP-IDF via PlatformIO. Siehe `firmware/tools/flash.ps1` (flasht direkt).
+ESP-IDF via PlatformIO. `firmware/tools/flash.ps1` baut + flasht direkt;
+ausführliche Anleitung (Parameter, Download-Modus, OTA) in
+[`firmware/tools/README.md`](firmware/tools/README.md). Die Konfig-Verwaltung
+(verschlüsselter Export/Import, Config-Server) beschreibt `admin.ps1` in derselben
+README.
