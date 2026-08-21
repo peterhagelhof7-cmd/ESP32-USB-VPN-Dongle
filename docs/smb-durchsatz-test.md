@@ -37,4 +37,51 @@ Rohwerte 100 MB:
 - Ursache ist die **Single-Core-Grenze des ESP32-S2**: USB-NCM + WLAN + WireGuard-ChaCha20 (ohne Krypto-Hardwarebeschleuniger) laufen gemeinsam auf einem Kern; SMB kommt zusätzlich mit vielen kleinen Round-Trips (latenzempfindlich über den Tunnel). Das ist der bekannte offene Punkt aus Phase 10 (Performance/Stabilität).
 - Lesen durchgehend etwas schneller als Schreiben (RX-Pfad günstiger als der TX-/SNAT-Pfad).
 - Die größere Datei ist minimal schneller (100 MB ~1,9–2,2 Mbit/s vs. 10 MB ~1,4–1,7 Mbit/s): der pro-Transfer-Overhead (SMB-Setup) amortisiert sich, die Rate bleibt aber im selben niedrigen Band – die Grenze ist der Dauerdurchsatz, nicht der Startaufwand.
-- **Fazit:** Für Verwaltungszugriffe/kleine Dateien und RDP-Steuerung nutzbar, aber **nicht für große SMB-Kopien** geeignet. Für höheren Durchsatz wäre ein Dual-Core-Modul mit Krypto-Beschleunigung (ESP32-S3) die Option (im Konzept als Risiko 2 vermerkt).
+- **Fazit (Baseline):** Für Verwaltungszugriffe/kleine Dateien und RDP-Steuerung nutzbar, aber **nicht für große SMB-Kopien** geeignet.
+
+---
+
+## Optimierung (Phase 10)
+
+Analyse: Der Durchsatz ist **compute-/krypto-gebunden** – WireGuard ChaCha20-Poly1305
+läuft rein in Software (der ESP32-S2 hat keinen ChaCha-Beschleuniger) und der Code
+wird über den Instruction-Cache aus dem Flash ausgeführt. lwIP-TCP-Fenster sind
+**irrelevant**, weil der Dongle kein TCP terminiert, sondern nur verschlüsselt/routet.
+
+Angewandte Stellschrauben (alle ohne DRAM-Kosten – der min-Heap dippt unter Last
+auf **~0,5 KB**, jede DRAM-fressende Maßnahme wie ein 16-KB-I-Cache würde einen
+Boot-/Last-OOM auslösen):
+
+1. **CPU 160 → 240 MHz** – voller Takt, ~linear mehr Krypto-Durchsatz.
+2. **Compiler -Og (Debug) → -O2 (Performance)** – beschleunigt die ChaCha/Poly-
+   Innenschleifen deutlich.
+3. **lwIP-IRAM-Optimierung** – Forwarding-Hotpath (ip4_forward/NAPT) ins IRAM
+   (separater Heap, kostet **kein** DRAM) → weniger Flash-Cache-Stalls je Paket.
+
+Verworfen: 16-KB-Instruction-Cache (kostet ~8 KB DRAM → OOM-Risiko bei ~0,5 KB
+min-Heap) und Flash-Modus DIO→QIO (kann den Boot des S2-Mini brechen, Recovery nur
+physisch). WG-Krypto per Linker-Fragment ins IRAM: nicht umsetzbar, da esp_wireguard
+als PlatformIO-lib außerhalb des IDF-Komponentengraphen gelinkt wird (`ldgen` erfasst
+die Archiv-Objekte nicht).
+
+### Messverlauf (10 MB, gleicher Aufbau)
+
+| Build | CPU / Compiler | Schreiben | Lesen |
+|---|---|---|---|
+| Baseline (`cfg-merge`) | 160 MHz / -Og | 1,36 Mbit/s | 1,72 Mbit/s |
+| `perf-240-o2` | 240 MHz / -O2 | 2,31 Mbit/s | 2,78 Mbit/s |
+| `perf2-lwipiram` | 240 MHz / -O2 + lwIP-IRAM | **2,65 Mbit/s** | **2,89 Mbit/s** |
+| **Gewinn gesamt** | | **+95 %** | **+68 %** |
+
+Integrität in allen Läufen bit-genau (SHA-256).
+
+### Wo die Grenze liegt
+
+Der **min-Heap unter Last (~0,5 KB)** ist die harte Wand: Der Forwarding-Pfad
+alloziert pro Paket (u. a. der USB-RX-`memcpy`), sodass größere Puffer oder ein
+größerer Cache das Gerät ins OOM treiben würden. Damit sind die **sicheren
+Software-Hebel auf dem S2 ausgereizt** (Schreibrate praktisch verdoppelt).
+
+**Für das 5-Mbit-Ziel** ist ein **ESP32-S3** die realistische Option: mehr RAM
+gegen die Heap-Wand *und* mehr Rechenleistung (höherer Takt / Dual-Core) für die
+ChaCha-Software-Krypto. Der S2 ist auf ~2,5–3 Mbit/s praktisch am Limit.

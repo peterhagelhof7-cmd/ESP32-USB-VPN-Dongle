@@ -42,3 +42,18 @@ CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 
 # --- Task-Stack-Anzeige im Webinterface (uxTaskGetSystemState) ---
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# --- Performance (Phase 10): VPN-/Forwarding-Durchsatz ---
+# Der VPN-Durchsatz ist krypto-gebunden: WireGuard ChaCha20-Poly1305 laeuft rein
+# in Software (der ESP32-S2 hat KEINE ChaCha-Hardwarebeschleunigung) auf EINEM
+# Kern zusammen mit USB-NCM + WLAN. Zwei Stellschrauben ohne Heap-Kosten:
+#  1) Vollen Takt nutzen (160 -> 240 MHz): +50 % Rechenleistung, ~linear mehr
+#     Krypto-Durchsatz.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+#  2) Compiler von -Og (Debug) auf -O2 (Performance): beschleunigt die
+#     Krypto-/Forwarding-Innenschleifen deutlich (kostet Flash/IRAM, kein Heap).
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# lwIP-Hotpath (ip4_forward/NAPT) ins IRAM -> weniger Flash-Cache-Stalls pro
+# weitergeleitetem Paket. Kostet IRAM (separater Heap), NICHT den knappen DRAM.
+CONFIG_LWIP_IRAM_OPTIMIZATION=y

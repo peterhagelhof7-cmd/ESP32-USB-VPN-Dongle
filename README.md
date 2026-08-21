@@ -39,10 +39,12 @@ Vollständige Konzeptbeschreibung: `ESP32-USB-VPN-Dongle.txt`.
    gewinnt ohne Metrik-Gefummel), Split als WG-Remote-Subnetz. Kein manuelles
    `route add` mehr nötig; PC braucht nur einen DHCP-Renew (Neu-Einstecken).
    *(HW-verifiziert: PC routet automatisch durch den Tunnel, 0 % Verlust.)*
-10. 🔧 Performance/Stabilität. Gemessener VPN-Durchsatz aktuell **~1,4–2,2 Mbit/s**
-    (SMB durch den Tunnel, Datenintegrität einwandfrei) – unter dem Ziel von
-    5 Mbit VPN; Grenze ist der Single-Core-S2 (USB+WLAN+ChaCha ohne Krypto-HW).
-    Details: `docs/smb-durchsatz-test.md`.
+10. 🔧 Performance/Stabilität. VPN-Durchsatz optimiert von **~1,4 → ~2,7 Mbit/s**
+    (SMB-Schreiben, +95 %) durch CPU 240 MHz + Compiler -O2 + lwIP-IRAM; Integrität
+    einwandfrei. Grenze ist jetzt der **min-Heap unter Last (~0,5 KB)** plus die
+    Software-ChaCha auf dem Single-Core-S2 – die sicheren Software-Hebel sind
+    ausgereizt, für 5 Mbit VPN bräuchte es einen ESP32-S3 (mehr RAM + Rechenleistung).
+    Details/Messverlauf: `docs/smb-durchsatz-test.md`.
 
 **Treiberlos verifiziert auf Windows, macOS und iPadOS** (NCM-only, CDC-Konsole aus).
 

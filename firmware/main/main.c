@@ -57,7 +57,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "cfg-merge"
+#define FW_BUILD_TAG "perf2-lwipiram"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
