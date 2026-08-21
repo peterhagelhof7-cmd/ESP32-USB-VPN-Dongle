@@ -98,6 +98,23 @@ res.0.port=80
 Das Admin-Passwort wird **nie im Klartext** gespeichert — `admin.ps1` legt nur
 den SHA-256-Hash ab.
 
+### Import-Verhalten (Merge)
+
+Beim Einspielen gilt **Merge-Semantik**: Ein Bereich wird nur ersetzt, wenn die
+Konfig ihn **enthält**. Fehlt er komplett, bleibt der bestehende Wert am Gerät.
+
+- **WLAN-Liste**: nur ersetzt, wenn `wlan.count` oder `wlan.<n>.*` vorhanden.
+  Fehlt der WLAN-Block → bestehende WLANs bleiben. Explizit leeren mit
+  `wlan.count=0`.
+- **Ressourcen**: analog über `res.count` / `res.<n>.*` (leeren mit `res.count=0`).
+- **WireGuard / Systemname / Admin / Version**: pro Feld — vorhandene Zeilen
+  überschreiben, fehlende bleiben unverändert.
+
+So kann eine **Teil-Konfig** (z. B. nur ein VPN-Update über den Config-Server)
+gefahrlos ausgerollt werden, ohne die WLANs des Geräts zu verlieren; ein
+**vollständiges Backup** (das immer alle Bereiche enthält) wird weiterhin
+komplett wiederhergestellt.
+
 ## Krypto-Container (`.bhvpn`)
 
 ```

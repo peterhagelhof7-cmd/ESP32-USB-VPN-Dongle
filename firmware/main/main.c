@@ -57,7 +57,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "multiwlan-fix"
+#define FW_BUILD_TAG "cfg-merge"
 static volatile uint32_t s_rx_count;
 
 // KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
@@ -873,8 +873,10 @@ static char *config_export_json(void)
 static bool config_import_json(char *text)
 {
     if (!text) return false;
-    memset(s_res, 0, sizeof(s_res));
-    memset(s_wlans, 0, sizeof(s_wlans)); s_wlan_count = 0;
+    // Merge-Semantik: ein Bereich (WLAN / Ressourcen) wird NUR ersetzt, wenn die
+    // Config ihn enthaelt (count- oder N.*-Schluessel gesehen). Fehlt er komplett
+    // -> bestehende Werte bleiben. WG/Systemname/Admin sind ohnehin per-Key-Merge.
+    bool has_wlan = false, has_res = false;
     char *line = text;
     while (line && *line) {
         char *nl = strchr(line, '\n');
@@ -887,7 +889,11 @@ static bool config_import_json(char *text)
             const char *k = line, *v = eq + 1;
             if      (!strcmp(k, "version"))       s_cfg_version = atoi(v);
             else if (!strcmp(k, "systemname"))    strlcpy(s_systemname, v, sizeof(s_systemname));
+            else if (!strcmp(k, "wlan.count")) {
+                if (!has_wlan) { memset(s_wlans, 0, sizeof(s_wlans)); s_wlan_count = 0; has_wlan = true; }
+            }
             else if (!strncmp(k, "wlan.", 5) && k[5] >= '0' && k[5] <= '9') {
+                if (!has_wlan) { memset(s_wlans, 0, sizeof(s_wlans)); s_wlan_count = 0; has_wlan = true; }
                 int idx = atoi(k + 5);
                 const char *dot = strchr(k + 5, '.');
                 if (dot && idx >= 0 && idx < MAX_WLAN) {
@@ -909,7 +915,11 @@ static bool config_import_json(char *text)
             else if (!strcmp(k, "wg.vpn_off"))    s_vpn_off = atoi(v) != 0;
             else if (!strcmp(k, "admin.user"))    strlcpy(s_admin_user, v, sizeof(s_admin_user));
             else if (!strcmp(k, "admin.phash"))   strlcpy(s_admin_phash, v, sizeof(s_admin_phash));
+            else if (!strcmp(k, "res.count")) {
+                if (!has_res) { memset(s_res, 0, sizeof(s_res)); s_res_count = 0; has_res = true; }
+            }
             else if (!strncmp(k, "res.", 4)) {
+                if (!has_res) { memset(s_res, 0, sizeof(s_res)); s_res_count = 0; has_res = true; }
                 int idx = atoi(k + 4);
                 const char *dot = strchr(k + 4, '.');
                 if (dot && idx >= 0 && idx < MAX_RES) {
@@ -924,37 +934,41 @@ static bool config_import_json(char *text)
         }
         line = nl ? nl + 1 : NULL;
     }
-    // Ressourcen kompaktieren (nur mit name+addr), Reihenfolge erhalten.
-    int n = 0;
-    for (int i = 0; i < MAX_RES; i++) {
-        if (s_res[i].name[0] && s_res[i].addr[0]) {
-            if (!s_res[i].type[0]) strcpy(s_res[i].type, "rdp");
-            if (n != i) { s_res[n] = s_res[i]; memset(&s_res[i], 0, sizeof(s_res[i])); }
-            n++;
-        }
-    }
-    s_res_count = n;
-
     if (s_admin_phash[0]) {
         char def[65]; sha256_hex("admin", def);
         s_admin_is_default = (strcmp(s_admin_phash, def) == 0);
     }
 
-    // WLAN-Liste kompaktieren (nur Eintraege mit SSID), Reihenfolge = Prioritaet.
-    int wn = 0;
-    for (int i = 0; i < MAX_WLAN; i++) {
-        if (s_wlans[i].ssid[0]) {
-            if (wn != i) { s_wlans[wn] = s_wlans[i]; memset(&s_wlans[i], 0, sizeof(s_wlans[i])); }
-            wn++;
+    // Ressourcen NUR ersetzen, wenn die Config sie enthielt (sonst unveraendert).
+    if (has_res) {
+        int n = 0;
+        for (int i = 0; i < MAX_RES; i++) {
+            if (s_res[i].name[0] && s_res[i].addr[0]) {
+                if (!s_res[i].type[0]) strcpy(s_res[i].type, "rdp");
+                if (n != i) { s_res[n] = s_res[i]; memset(&s_res[i], 0, sizeof(s_res[i])); }
+                n++;
+            }
         }
+        s_res_count = n;
+        res_save();
     }
-    s_wlan_count = wn;
-    if (s_wlan_count > 0) {
-        strlcpy(s_wifi_ssid, s_wlans[0].ssid, sizeof(s_wifi_ssid));
-        strlcpy(s_wifi_pass, s_wlans[0].pass, sizeof(s_wifi_pass));
+    // WLANs NUR ersetzen, wenn die Config sie enthielt (sonst unveraendert).
+    if (has_wlan) {
+        int wn = 0;
+        for (int i = 0; i < MAX_WLAN; i++) {
+            if (s_wlans[i].ssid[0]) {
+                if (wn != i) { s_wlans[wn] = s_wlans[i]; memset(&s_wlans[i], 0, sizeof(s_wlans[i])); }
+                wn++;
+            }
+        }
+        s_wlan_count = wn;
+        if (s_wlan_count > 0) {
+            strlcpy(s_wifi_ssid, s_wlans[0].ssid, sizeof(s_wifi_ssid));
+            strlcpy(s_wifi_pass, s_wlans[0].pass, sizeof(s_wifi_pass));
+        }
+        wlan_list_save();
     }
 
-    wlan_list_save();
     wg_creds_save();
     nvs_handle_t nh;
     if (nvs_open("admin", NVS_READWRITE, &nh) == ESP_OK) {
@@ -962,7 +976,6 @@ static bool config_import_json(char *text)
         nvs_set_str(nh, "phash", s_admin_phash);
         nvs_commit(nh); nvs_close(nh);
     }
-    res_save();
     sys_save();
     return true;
 }
