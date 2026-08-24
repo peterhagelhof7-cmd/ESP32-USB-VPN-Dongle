@@ -57,7 +57,7 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "s3-port"
+#define FW_BUILD_TAG "captive-auto"
 static volatile uint32_t s_rx_count;
 
 // Status-LED: board-abhaengig implementiert (siehe led_set/led_init weiter unten).
@@ -744,6 +744,11 @@ static void sn_string(char out[13])
     snprintf(out, 13, "%02X%02X%02X%02X%02X%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
 }
 
+// Captive-Portal automatisch aktivieren, solange KEIN WLAN verbunden ist -> das
+// OS-"Anmelden"-Popup fuehrt dann auf die WLAN-Konfigseite (Onboarding/Recovery).
+// Einstellung (NVS "capauto"), Default an. Bei WLAN-Verbindung wieder frei.
+static bool s_captive_auto = true;
+
 static void sys_load(void)
 {
     nvs_handle_t h;
@@ -753,6 +758,7 @@ static void sys_load(void)
     n = sizeof(s_cfg_secret); nvs_get_str(h, "secret", s_cfg_secret, &n);
     n = sizeof(s_cfg_server); nvs_get_str(h, "server", s_cfg_server, &n);
     nvs_get_i32(h, "cfgver", &s_cfg_version);
+    uint8_t cb; if (nvs_get_u8(h, "capauto", &cb) == ESP_OK) s_captive_auto = cb;
     nvs_close(h);
 }
 static void sys_save(void)
@@ -763,6 +769,7 @@ static void sys_save(void)
     nvs_set_str(h, "secret", s_cfg_secret);
     nvs_set_str(h, "server", s_cfg_server);
     nvs_set_i32(h, "cfgver", s_cfg_version);
+    nvs_set_u8(h, "capauto", s_captive_auto ? 1 : 0);
     nvs_commit(h); nvs_close(h);
 }
 
@@ -885,6 +892,7 @@ static char *config_export_json(void)
     APP("schema=1\n");
     APP("version=%d\n", (int)s_cfg_version);
     APP("systemname=%s\n", s_systemname);
+    APP("captive_auto=%d\n", s_captive_auto ? 1 : 0);
     APP("sn=%s\n", sn);
     APP("wlan.count=%d\n", s_wlan_count);
     for (int i = 0; i < s_wlan_count; i++) {
@@ -937,6 +945,7 @@ static bool config_import_json(char *text)
             const char *k = line, *v = eq + 1;
             if      (!strcmp(k, "version"))       s_cfg_version = atoi(v);
             else if (!strcmp(k, "systemname"))    strlcpy(s_systemname, v, sizeof(s_systemname));
+            else if (!strcmp(k, "captive_auto"))  s_captive_auto = (atoi(v) != 0);
             else if (!strcmp(k, "wlan.count")) {
                 if (!has_wlan) { memset(s_wlans, 0, sizeof(s_wlans)); s_wlan_count = 0; has_wlan = true; }
             }
@@ -1371,12 +1380,19 @@ static esp_err_t settings_get(httpd_req_t *req)
         s_cfg_secret[0] ? "gesetzt" : "NICHT gesetzt (fuer Up-/Download noetig)",
         s_cfg_server[0] ? s_cfg_server : "(keiner)");
 
-    // Internet-Zugang (Captive).
+    // Internet-Zugang (Captive) + Auto-Captive-Einstellung.
     SENDF(req, "<div class=card><h2>Internet-Zugang</h2>"
-        "<div class=v>Status: <b style='color:%s'>%s</b></div>%s</div>",
+        "<div class=v>Status: <b style='color:%s'>%s</b></div>"
+        "<form method=post action=/sys style='margin-top:6px;font-size:13px'>"
+        "<input type=hidden name=capform value=1>"
+        "<label><input type=checkbox name=capauto %s> Captive-Portal automatisch bei fehlendem WLAN</label> "
+        "<button type=submit>Speichern</button></form>%s</div>",
         s_unlocked ? "#43d17a" : "#f0a35e", s_unlocked ? "frei" : "gesperrt",
-        s_unlocked ? "<form method=post action=/lock><button>Sperren</button></form>"
-                   : "<form method=post action=/unlock><button>Freigeben</button></form>");
+        s_captive_auto ? "checked" : "",
+        s_captive_auto
+            ? "<div class=k style='margin-top:4px'>Automatik aktiv: WLAN steuert den Zustand (kein WLAN &rarr; Anmelde-Portal).</div>"
+            : (s_unlocked ? "<form method=post action=/lock style='margin-top:4px'><button>Sperren</button></form>"
+                          : "<form method=post action=/unlock style='margin-top:4px'><button>Freigeben</button></form>"));
 
     // WLAN-Verwaltung: gespeicherte WLANs (Prioritaet), hoch/loeschen + hinzufuegen.
     httpd_resp_sendstr_chunk(req, "<div class=card><h2>WLAN-Verwaltung</h2>"
@@ -1859,6 +1875,10 @@ static esp_err_t sys_post(httpd_req_t *req)
         }
     }
 #undef SYS_GETF
+    // Captive-Auto nur anfassen, wenn DAS Captive-Formular gesendet wurde
+    // (Marker capform) -> das System-Formular ohne Checkbox laesst es unberuehrt.
+    if (httpd_query_key_value(body, "capform", enc, sizeof(enc)) == ESP_OK)
+        s_captive_auto = (httpd_query_key_value(body, "capauto", enc, sizeof(enc)) == ESP_OK);
     sys_save();
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "/settings");
@@ -2486,6 +2506,10 @@ void app_main(void)
         if (s_vpn_off && s_wg_started) { wg_stop(); update_internet_gate(); }
         wlan_manager();     // Mehrere WLANs: Ausfall-/Prioritaets-Umschaltung
         wg_poll();          // WireGuard-Peer-Status pruefen (+ LED)
+        // Captive-Auto: solange kein WLAN verbunden ist -> gesperrt (Captive-Portal,
+        // "Anmelden"-Popup zeigt die WLAN-Seite); mit WLAN -> frei. Wenn die
+        // Einstellung aus ist, gilt nur die manuelle Sperren/Freigeben-Wahl.
+        if (s_captive_auto && s_unlocked != s_wifi_connected) s_unlocked = s_wifi_connected;
         update_internet_gate();  // idempotent: NAPT-Gate an Zustand angleichen (Default entsperrt)
         // Config-Server: EINMALIG 3 min nach WLAN-Connect nachsehen (sonst manuell).
         if (s_wifi_connected && !s_cfg_checked_once && s_cfg_server[0] && s_cfg_secret[0]
