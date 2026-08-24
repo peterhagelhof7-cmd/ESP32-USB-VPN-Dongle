@@ -1,0 +1,17 @@
+# ===========================================================================
+# ESP32-S3-DevKitC-1 N16R8 (16 MB Flash + 8 MB Octal-PSRAM).
+# Wird von IDF ZUSAETZLICH zu sdkconfig.defaults angewandt (target-spezifisch).
+# ===========================================================================
+
+# --- 16 MB Flash + 16-MB-Partitionstabelle ---
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16m.csv"
+
+# --- Octal-PSRAM (N16R8: 8 MB), 80 MHz ---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+# WiFi-/lwIP-Puffer bevorzugt ins PSRAM -> entlastet den internen RAM. Auf dem
+# S2 (ohne PSRAM) war genau der interne RAM der Engpass (min-Heap ~0,7 KB unter
+# Last); auf dem S3 ist reichlich PSRAM da.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y

@@ -57,15 +57,10 @@ static const char *TAG = "usbvpn";
 // DIAGNOSE: 1 = TX verwerfen (send_sync nicht aufrufen) -> Deadlock-Test.
 #define DIAG_TX_NOOP 0
 // Sichtbarer Build-Marker (Beleg, welches Image nach OTA laeuft).
-#define FW_BUILD_TAG "perf2-lwipiram"
+#define FW_BUILD_TAG "s3-port"
 static volatile uint32_t s_rx_count;
 
-// KY-016 RGB-Status-LED (gemeinsame Kathode -> HIGH = an). Pins ggf. an die
-// Verdrahtung anpassen. Phase 1: rot (noch nichts verbunden).
-#define LED_R_PIN GPIO_NUM_5
-#define LED_G_PIN GPIO_NUM_6
-#define LED_B_PIN GPIO_NUM_7
-
+// Status-LED: board-abhaengig implementiert (siehe led_set/led_init weiter unten).
 static esp_netif_t *s_usb_netif;
 
 // --- WLAN-Uplink (STA) Zustand ---
@@ -106,6 +101,58 @@ static void set_internet(bool on)
     ESP_LOGI(TAG, "Internet-Freigabe: %s", s_nat_on ? "AN (NAT)" : "AUS");
 }
 
+// ============================ Status-LED =====================================
+// Gleiche Schnittstelle led_set(r,g,b) (0/1 je Kanal) fuer zwei Boards:
+//  - ESP32-S3-DevKitC-1: interne adressierbare RGB-LED (WS2812) an GPIO48,
+//    getrieben ueber die led_strip-Komponente (RMT). -DBOARD_LED_WS2812=48.
+//  - Wemos S2 Mini: externe KY-016 (gemeinsame Kathode, HIGH = an) an GPIO5/6/7.
+#if defined(BOARD_LED_WS2812)
+// WS2812 direkt ueber den RMT-Treiber (kein externes led_strip -> dessen
+// SPI-Backend ist mit IDF 6.0.1 nicht kompilierbar). Aufloesung 10 MHz
+// (0,1 us/Tick); Bit-Timing 0=0,3us/0,9us, 1=0,9us/0,3us (WS2812-Standard).
+#include "driver/rmt_tx.h"
+#include "driver/rmt_encoder.h"
+static rmt_channel_handle_t s_rmt_chan;
+static rmt_encoder_handle_t s_rmt_enc;
+
+static void led_set(int r, int g, int b)
+{
+    if (!s_rmt_chan || !s_rmt_enc) return;
+    // 0/1 je Kanal -> gedimmte Vollfarbe (WS2812 waere voll aufgedreht grell).
+    // HW-Befund an diesem DevKitC-1: die LED ist RGB-geordnet (R zuerst), NICHT
+    // das Standard-WS2812-GRB -> Bytes in Reihenfolge R, G, B senden.
+    uint8_t rgb[3] = { (uint8_t)(r ? 40 : 0), (uint8_t)(g ? 40 : 0), (uint8_t)(b ? 40 : 0) };
+    rmt_transmit_config_t tx = { .loop_count = 0 };
+    if (rmt_transmit(s_rmt_chan, s_rmt_enc, rgb, sizeof(rgb), &tx) == ESP_OK) {
+        rmt_tx_wait_all_done(s_rmt_chan, 100);   // >50us Pause danach = Latch
+    }
+}
+
+static void led_init(void)
+{
+    rmt_tx_channel_config_t chan_cfg = {
+        .clk_src           = RMT_CLK_SRC_DEFAULT,
+        .gpio_num          = BOARD_LED_WS2812,
+        .mem_block_symbols = 64,
+        .resolution_hz     = 10 * 1000 * 1000,   // 10 MHz
+        .trans_queue_depth = 4,
+    };
+    if (rmt_new_tx_channel(&chan_cfg, &s_rmt_chan) != ESP_OK) { s_rmt_chan = NULL; return; }
+
+    rmt_bytes_encoder_config_t enc_cfg = {
+        .bit0 = { .level0 = 1, .duration0 = 3, .level1 = 0, .duration1 = 9 },  // 0,3us / 0,9us
+        .bit1 = { .level0 = 1, .duration0 = 9, .level1 = 0, .duration1 = 3 },  // 0,9us / 0,3us
+        .flags = { .msb_first = 1 },
+    };
+    if (rmt_new_bytes_encoder(&enc_cfg, &s_rmt_enc) != ESP_OK) { s_rmt_enc = NULL; return; }
+    rmt_enable(s_rmt_chan);
+    led_set(1, 0, 0);   // rot
+}
+#else
+#define LED_R_PIN GPIO_NUM_5
+#define LED_G_PIN GPIO_NUM_6
+#define LED_B_PIN GPIO_NUM_7
+
 static void led_set(int r, int g, int b)
 {
     gpio_set_level(LED_R_PIN, r);
@@ -122,6 +169,7 @@ static void led_init(void)
     gpio_config(&io);
     led_set(1, 0, 0);   // rot
 }
+#endif
 
 // --- USB-NCM <-> esp_netif Glue (dokumentiertes Custom-Driver-Muster) --------
 typedef struct { esp_netif_driver_base_t base; } usb_driver_t;
@@ -1209,18 +1257,39 @@ static esp_err_t root_get(httpd_req_t *req)
     SENDF(req, "<div class=k style='margin:-8px auto 8px'>Firmware %s (%s) &middot; Konfig v%d</div>",
           app ? app->version : "?", FW_BUILD_TAG, (int)s_cfg_version);
 
-    // WLAN-Karte (Status, gespeicherte WLANs, Scan, hinzufuegen) -- ohne Login.
+    // WLAN-Signalstaerke (nur wenn verbunden).
+    int rssi = 0; bool rssi_ok = false;
+    if (s_wifi_connected) {
+        wifi_ap_record_t apr;
+        if (esp_wifi_sta_get_ap_info(&apr) == ESP_OK) { rssi = apr.rssi; rssi_ok = true; }
+    }
+
+    // WLAN-Karte (Status, Signal, gespeicherte WLANs, Scan, hinzufuegen) -- ohne Login.
     SENDF(req, "<div class=card><h2>WLAN</h2>"
         "<div class=v>Status: <b style='color:%s'>%s</b>%s%s</div>"
         "<div class=v>IP vom Router: %s</div>"
-        "<div class=v>Internet-Routing: <b style='color:%s'>%s</b></div>"
-        "<div class=k style='margin-top:4px'>Gespeicherte WLANs (Prioritaet):</div>",
+        "<div class=v>Internet-Routing: <b style='color:%s'>%s</b></div>",
         s_wifi_connected ? "#43d17a" : "#f0a35e",
         s_wifi_connected ? "verbunden" : (s_wifi_ssid[0] ? "verbinde ..." : "nicht konfiguriert"),
         s_wifi_connected ? " mit " : "", s_wifi_connected ? s_wifi_ssid : "",
         ipbuf,
         (s_nat_on && s_wifi_connected) ? "#43d17a" : "#f0a35e",
         (s_nat_on && s_wifi_connected) ? "aktiv (NAT)" : (s_nat_on ? "wartet auf WLAN" : "aus"));
+    // Signalstaerke als dBm + Qualitaetslabel + Balken (0..100 % aus dBm).
+    if (rssi_ok) {
+        const char *ql, *qc;
+        if      (rssi >= -55) { ql = "ausgezeichnet"; qc = "#43d17a"; }
+        else if (rssi >= -67) { ql = "gut";           qc = "#43d17a"; }
+        else if (rssi >= -75) { ql = "mittel";        qc = "#f0a35e"; }
+        else                  { ql = "schwach";       qc = "#ef6b6b"; }
+        int pct = 2 * (rssi + 100);
+        if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+        SENDF(req, "<div class=v style='margin-top:4px'>Signal: <b style='color:%s'>%d dBm &middot; %s</b></div>"
+            "<div style='height:8px;background:#0f1626;border:1px solid #33406a;border-radius:4px;margin-top:3px'>"
+            "<div style='height:100%%;width:%d%%;background:%s;border-radius:3px'></div></div>",
+            qc, rssi, ql, pct, qc);
+    }
+    httpd_resp_sendstr_chunk(req, "<div class=k style='margin-top:6px'>Gespeicherte WLANs (Prioritaet):</div>");
     send_wlan_list(req, false);
     httpd_resp_sendstr_chunk(req,
         "<button type=button onclick='scan()' style='margin:6px'>Netzwerke suchen</button>"
