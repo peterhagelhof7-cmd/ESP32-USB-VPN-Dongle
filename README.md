@@ -1,6 +1,6 @@
 # ESP32-USB-VPN-Dongle
 
-Kleiner USB-Dongle (Wemos **S2 Mini** / ESP32-S2), der sich gegenüber Windows/macOS
+Kleiner USB-Dongle (ESP32-S2 **oder** ESP32-S3), der sich gegenüber Windows/macOS
 als **USB-Netzwerkadapter (NCM)** meldet und intern alles übernimmt: WLAN-Client,
 DHCP/DNS, NAT/Routing, Captive-Portal-Zwangsanmeldung, WireGuard-Tunnel,
 Kill-Switch/Firewall, Web-UI mit Admin-Login, RDP-/Ressourcen-Manager.
@@ -8,9 +8,17 @@ Der PC braucht keinen Treiber und keine Konfiguration – nur einstecken.
 
 Vollständige Konzeptbeschreibung: `ESP32-USB-VPN-Dongle.txt`.
 
-## Hardware
-- **Wemos S2 Mini** (ESP32-S2, natives USB-OTG, USB-C, 4 MB Flash).
-- Status-LED **KY-016** (RGB): rot = WLAN+VPN aus, blau = WLAN, grün = VPN.
+## Hardware (zwei unterstützte Boards)
+Gleiche Codebasis + Funktionsumfang, Board-Auswahl über PlatformIO-Env bzw.
+`flash.ps1 -Board`. **Details/Vergleich: [`docs/hardware-boards.md`](docs/hardware-boards.md).**
+
+- **Wemos S2 Mini** (`lolin_s2_mini`) — ESP32-S2 Single-Core, 4 MB Flash, kein
+  PSRAM; Status-LED **KY-016** an GPIO5/6/7; Flashen im Download-Modus.
+- **ESP32-S3-DevKitC-1 N16R8** (`esp32-s3-devkitc-1`) — ESP32-S3 Dual-Core, 16 MB
+  Flash, **8 MB PSRAM** (~8,4 MB freier Heap); interne **WS2812** an GPIO48;
+  Flashen über den UART-Port (Auto-Reset, kein Download-Modus).
+
+LED-Zustände (beide): rot = kein Uplink · blau = WLAN · grün = VPN-Tunnel aktiv.
 
 ## Entwicklungsphasen
 1. ✅ **USB-NCM Proof-of-Life**: PC sieht Netzwerkadapter, bekommt DHCP
@@ -63,13 +71,16 @@ auf **1**. Der einzige Slot ist schon von der eigenen Tunnel-IP (`/32`) belegt, 
 läuft ins `ERR_RTE` (Handshake steht, Datenebene tot). Fix in `platformio.ini`:
 `-DCONFIG_WIREGUARD_MAX_SRC_IPS=8`.
 
-### Status-LED (KY-016)
+### Status-LED
 rot = kein Uplink · blau = WLAN verbunden · grün = VPN-Tunnel aktiv.
+S2: KY-016 an GPIO5/6/7. S3: interne WS2812 an GPIO48 (siehe `docs/hardware-boards.md`).
 
 ### Hinweis zum Flashen
-Der S2 (natives USB) reagiert nicht auf esptool-Auto-Reset. Nach dem Erstflash
-laufen Updates bequem per **OTA** übers Webinterface. Für den Erstflash bzw. zur
-Recovery: Download-Modus (BOOT halten, RST tippen), dann `tools/flash.ps1`.
+- **S2:** natives USB reagiert nicht auf esptool-Auto-Reset → Erstflash/Recovery
+  im **Download-Modus** (BOOT halten, RST tippen), dann `tools/flash.ps1 -Board S2`.
+- **S3:** über den **UART-Port** (Auto-Reset, kein Download-Modus):
+  `tools/flash.ps1 -Board S3`.
+- **Beide:** danach laufen Updates bequem per **OTA** übers Webinterface.
 
 ## Bekannte Risiken (siehe Projekt-Review)
 - Zero-Driver-NCM auf allen Windows-Versionen (Inbox-NCM erst ~Win10 2004).
@@ -78,7 +89,8 @@ Recovery: Download-Modus (BOOT halten, RST tippen), dann `tools/flash.ps1`.
 - macOS + DHCP-Option 121 (Split-Tunnel-Routing) evtl. unzuverlässig.
 
 ## Bauen / Flashen
-ESP-IDF via PlatformIO. `firmware/tools/flash.ps1` baut + flasht direkt;
+ESP-IDF via PlatformIO. `firmware/tools/flash.ps1 -Board <S2|S3>` baut + flasht
+direkt (Board-Vergleich + Details: [`docs/hardware-boards.md`](docs/hardware-boards.md));
 ausführliche Anleitung (Parameter, Download-Modus, OTA) in
 [`firmware/tools/README.md`](firmware/tools/README.md). Die Konfig-Verwaltung
 (verschlüsselter Export/Import, Config-Server) beschreibt `admin.ps1` in derselben
