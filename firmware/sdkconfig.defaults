@@ -21,7 +21,9 @@ CONFIG_LWIP_IPV4_NAPT=y
 CONFIG_LWIP_DHCPS=y
 
 # Groesserer Main-Task-Stack: der Heartbeat startet WireGuard (esp_wireguard_init
-# macht DNS-Aufloesung + Krypto) -> 4096 reicht nicht (wie ESP-BMC).
+# macht DNS-Aufloesung + Krypto). 16384 gilt fuer den S3 (reichlich RAM, so
+# HW-geprueft). Der S2 ueberschreibt das in sdkconfig.defaults.esp32s2 mit 4096
+# (kein PSRAM, jedes KB DRAM zaehlt; so seit Phase 1 HW-geprueft).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
 # WICHTIG fuer WireGuard: droscy/esp_wireguard legt sein netif per rohem

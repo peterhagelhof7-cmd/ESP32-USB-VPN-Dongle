@@ -1,4 +1,9 @@
 ## IDF Component Manager Manifest
 dependencies:
+  # Exakte Versionen = auf HW geprueft (S2 + S3, v1.0.1). Ohne Pin holt ein
+  # frischer Checkout die jeweils neueste Version -> andere Firmware als geprueft.
+  # Hochziehen nur bewusst und mit HW-Test.
   espressif/esp_tinyusb:
-    version: "^2.0.1~1"
+    version: "==2.2.1"
+  espressif/tinyusb:
+    version: "==0.21.0~1"

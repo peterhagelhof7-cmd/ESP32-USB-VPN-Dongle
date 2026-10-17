@@ -1,0 +1,14 @@
+# ===========================================================================
+# Wemos S2 Mini (ESP32-S2, 4 MB Flash, kein PSRAM).
+# Wird von IDF ZUSAETZLICH zu sdkconfig.defaults angewandt (target-spezifisch).
+# ===========================================================================
+
+# --- Main-Task-Stack: 4096 statt 16384 (sdkconfig.defaults) ---
+# Der S2 hat keinen PSRAM, sein freier Heap faellt unter Last auf ~0,5 KB.
+# 16 KB Stack kosten 12 KB mehr DRAM -> sicherer Out-of-Memory unter Last.
+# Mit 4096 laeuft der S2 seit Phase 1 (die 16384 aus Phase 5 kamen durch die
+# PlatformIO-Falle nie in seine sdkconfig) - inkl. WireGuard-Start im Main-Task
+# und SMB-Lasttest durch den Tunnel (docs/smb-durchsatz-test.md), HW-geprueft
+# bis v1.0.1. Reserve pruefen: Einstellungen -> System-Status -> Task-Stacks
+# (Zeile "main", freier Stack).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
