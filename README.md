@@ -77,6 +77,13 @@ pio run -e lolin_s2_mini
 
 Web-Flasher-Dateien aus einem Build erzeugen: `tools\webflasher-update.ps1` (siehe Kopf des Skripts).
 
+**Reproduzierbar:** esp_tinyusb, tinyusb (`firmware/main/idf_component.yml`) und libsodium
+(`platformio.ini`) sind auf die geprüften Versionen festgelegt, die board-spezifischen Defaults
+(`sdkconfig.defaults.esp32s2` / `.esp32s3`) ergänzen `sdkconfig.defaults`. Ein frischer Checkout
+erzeugt so dieselbe Konfiguration wie die geprüfte Firmware. **PlatformIO-Falle:** Geänderte
+`sdkconfig.defaults*` greifen nur, wenn `firmware/sdkconfig.<env>` noch nicht existiert – nach einer
+Änderung diese Datei löschen.
+
 ### Gotcha: `WIREGUARD_MAX_SRC_IPS`
 
 esp_wireguard setzt die Zahl der Allowed-IPs pro Peer ohne `CONFIG_WIREGUARD_MAX_SRC_IPS` auf **1**.
