@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VPN-Dongle Web-Flasher</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+  :root {
+    --bg: #0f1420; --card: #182033; --border: #2a3550; --fg: #e6e9f2;
+    --muted: #9aa4bf; --accent: #46c46a; --warn: #e0a83c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 18px; margin: 0 0 12px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 22px; margin: 0 0 18px;
+  }
+  .card p { margin: 8px 0; }
+  ol { margin: 8px 0; padding-left: 22px; }
+  li { margin: 4px 0; }
+  .note {
+    background: #1d2740; border-left: 3px solid var(--accent); border-radius: 6px;
+    padding: 10px 14px; margin: 14px 0; color: var(--muted); font-size: 14px;
+  }
+  .warnbox { border-left-color: var(--warn); }
+  esp-web-install-button button, button {
+    background: var(--accent); color: #08101f; border: 0; border-radius: 8px;
+    padding: 10px 18px; font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+  td, th { padding: 7px 6px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  code { background: #0d1322; padding: 1px 6px; border-radius: 4px; word-break: break-all; }
+  a { color: var(--accent); }
+  .muted { color: var(--muted); }
+  footer { color: var(--muted); font-size: 13px; margin-top: 26px; text-align: center; }
+  .tablewrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ESP32-USB-VPN-Dongle</h1>
+  <p class="sub">Firmware direkt aus dem Browser installieren – für Wemos S2 Mini und ESP32-S3-DevKitC-1 N16R8.
+    Version <b id="ver">…</b></p>
+
+  <div class="card">
+    <h2>Installieren</h2>
+    <esp-web-install-button manifest="manifest.json">
+      <button slot="activate">Installieren</button>
+      <span slot="unsupported"><div class="note warnbox">Dieser Browser kann kein <b>Web Serial</b>.
+        Bitte <b>Chrome, Edge oder Opera am Desktop</b> verwenden (nicht Firefox, Safari, iPhone/iPad).</div></span>
+      <span slot="not-allowed"><div class="note warnbox">Web Serial geht nur über HTTPS – diese Seite direkt
+        über GitHub Pages öffnen.</div></span>
+    </esp-web-install-button>
+    <p class="muted">Der Flasher erkennt S2 oder S3 selbst und spielt die passende Firmware auf.
+      Beim ersten Mal <b>„Gerät löschen“</b> anhaken.</p>
+  </div>
+
+  <div class="card">
+    <h2>ESP32-S3-DevKitC-1</h2>
+    <ol>
+      <li>USB-Kabel an den Port <b>UART</b> stecken (nicht „USB“).</li>
+      <li><b>Installieren</b> → den Port wählen (CP210x / „USB to UART“).</li>
+      <li>Nach dem Flashen das Kabel an den Port <b>USB</b> umstecken – der PC sieht einen neuen
+        Netzwerkadapter.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>Wemos S2 Mini</h2>
+    <ol>
+      <li>In den <b>Download-Modus</b>: Taste <b>0</b> (BOOT) gedrückt halten, <b>RST</b> kurz drücken,
+        BOOT loslassen.</li>
+      <li><b>Installieren</b> → den neu erschienenen Port wählen („ESP32-S2“).</li>
+      <li>Nach dem Flashen einmal <b>RST</b> drücken – der S2 startet nicht von selbst neu und meldet sich
+        danach als Netzwerkadapter.</li>
+    </ol>
+    <div class="note">Zum erneuten Flashen eines S2 immer zuerst in den Download-Modus – im Betrieb ist er
+      ein Netzwerkadapter, kein serieller Port.</div>
+  </div>
+
+  <div class="card">
+    <h2>Danach</h2>
+    <p>Windows/macOS melden „Anmeldung im Netzwerk erforderlich“ → draufklicken oder
+      <code>http://192.168.226.1/</code> öffnen → WLAN einrichten. Einstellungen: <code>admin</code> /
+      <code>admin</code> – <b>sofort ändern</b>.</p>
+    <p>Updates später ohne Flasher: Weboberfläche → Firmware-Update (OTA) mit der <code>.bin</code> aus den
+      <a href="https://github.com/peterhagelhof7-cmd/ESP32-USB-VPN-Dongle/releases">Releases</a>.</p>
+    <p>Anleitung: <a href="https://github.com/peterhagelhof7-cmd/ESP32-USB-VPN-Dongle/blob/main/docs/admin-guide.md">Admin-Guide</a></p>
+  </div>
+
+  <div class="card">
+    <h2>Dateien</h2>
+    <div class="tablewrap"><table id="files"><tr><th>Board</th><th>Datei</th><th>Größe</th><th>SHA-256</th></tr></table></div>
+  </div>
+
+  <footer>
+    <a href="https://github.com/peterhagelhof7-cmd/ESP32-USB-VPN-Dongle">GitHub</a> · GPL-3.0
+  </footer>
+</main>
+<script>
+  fetch('fw/info.json').then(r => r.json()).then(j => {
+    document.getElementById('ver').textContent = 'v' + j.version;
+    const t = document.getElementById('files');
+    const names = { s3: 'ESP32-S3', s2: 'ESP32-S2' };
+    for (const [b, files] of Object.entries(j.boards)) {
+      for (const [f, d] of Object.entries(files)) {
+        const tr = t.insertRow();
+        tr.insertCell().textContent = names[b] || b;
+        const a = document.createElement('a'); a.href = 'fw/' + b + '/' + f; a.textContent = f;
+        tr.insertCell().appendChild(a);
+        tr.insertCell().textContent = (d.size / 1024).toFixed(0) + ' KB';
+        const c = document.createElement('code'); c.textContent = d.sha256;
+        tr.insertCell().appendChild(c);
+      }
+    }
+  }).catch(() => { document.getElementById('ver').textContent = '?'; });
+</script>
+</body>
+</html>

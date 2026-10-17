@@ -1,0 +1,41 @@
+{
+    "version":  "1.0.1",
+    "boards":  {
+                   "s3":  {
+                              "bootloader.bin":  {
+                                                     "size":  21136,
+                                                     "sha256":  "bf0d60152d05edaf7f8c70b18be4be896180c61a57ceaced6589fb7b680e7a95"
+                                                 },
+                              "partitions.bin":  {
+                                                     "size":  3072,
+                                                     "sha256":  "cfbe19f7ed5f6b1105a21e5f1b4e9993e560eca4a8ecf6e418c0a3f5311b6fe2"
+                                                 },
+                              "ota_data_initial.bin":  {
+                                                           "size":  8192,
+                                                           "sha256":  "7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f"
+                                                       },
+                              "app.bin":  {
+                                              "size":  1149616,
+                                              "sha256":  "6dd924288619796eeea9d6e22d26668291bc453253fcc006d17b6ba21b5d1110"
+                                          }
+                          },
+                   "s2":  {
+                              "bootloader.bin":  {
+                                                     "size":  22176,
+                                                     "sha256":  "76473386da72c688322d700d13a7d50cfb2f23a10cfb4ecade2cfe5a02df3dfc"
+                                                 },
+                              "partitions.bin":  {
+                                                     "size":  3072,
+                                                     "sha256":  "9a2248620e1d915290f577dc7460c785fa8d8f3c6632e0db45616296601bd2a1"
+                                                 },
+                              "ota_data_initial.bin":  {
+                                                           "size":  8192,
+                                                           "sha256":  "7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f"
+                                                       },
+                              "app.bin":  {
+                                              "size":  1089904,
+                                              "sha256":  "362b01fca8b9da2a3c8754c6b8abdc891a1aaaf32c5c2638b63b3aed6cdd28b3"
+                                          }
+                          }
+               }
+}
